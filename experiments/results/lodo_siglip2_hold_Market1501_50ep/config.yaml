@@ -1,5 +1,5 @@
 experiment_id: lodo_siglip2_hold_Market1501_50ep
-git_commit: fd31f39f6d7ed8175c5f876af5e3b7f863e8eab2
+git_commit: 1635087e5971c0c73b151f624b13db590f9343fc
 git_dirty: true
 cache_dir: feature_cache_siglip2_full
 held_out_domain: Market1501

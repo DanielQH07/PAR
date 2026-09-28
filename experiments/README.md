@@ -33,10 +33,10 @@ SigLIP2 partial fine-tuning was interrupted by an unrelated GPU workload after e
 
 ## Reproducing the frozen probe
 
-Use `../.conda-upar2027/bin/python` from this repository. Cached features and downloaded weights are local, ignored by Git, and inference requires no network. Example:
+Activate `.venv` from the repository root with `source .venv/bin/activate`. Cached features and downloaded weights are local, ignored by Git, and inference requires no network. Example:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 ../.conda-upar2027/bin/python train_linear_probe_2027.py \
+PYTHONDONTWRITEBYTECODE=1 python src/train_linear_probe_2027.py \
   --cache-dir data/feature_cache_clip_full \
   --output-dir experiments/results/lp_clip_example_new_run \
   --epochs 50 --batch-size 2048 --lr 1e-3 --seed 605

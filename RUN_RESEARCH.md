@@ -2,6 +2,8 @@
 
 This guide documents the current frozen-feature and partial-fine-tuning code in this repository. Run commands from the repository root. Python 3.11 and an NVIDIA GPU are used for the tested setup.
 
+Repository structure and the data-to-evaluation flow are mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## 1. Create and activate the virtual environment
 
 ```bash
@@ -25,15 +27,16 @@ Expected on the tested host: `2.14.0+cu130`, CUDA available, Transformers `4.57.
 
 Use the organizer's [UPAR Challenge 2027 data repository](https://github.com/speckean/UPAR-Challenge-2027). It provides annotations and the official `download_datasets.py` script for Market1501, PA-100K, and PETA. The public development data currently has 97,669 train and 33,407 validation images.
 
-From the parent directory of this repository:
+From the repository root:
 
 ```bash
+project_root="$(pwd)"
 git clone https://github.com/speckean/UPAR-Challenge-2027.git ../upar2027_official
-source .venv/bin/activate
+source "$project_root/.venv/bin/activate"
 python -m pip install gdown
 cd ../upar2027_official
-python download_datasets.py --data-dir ../upar_challenge/data/phase1
-cd ../upar_challenge
+python download_datasets.py --data-dir "$project_root/data/phase1"
+cd "$project_root"
 ```
 
 The official annotation CSVs stay in `../upar2027_official/data/annotations/task1/{train,val}/gt.csv`; image paths in those CSVs resolve under `data/phase1/`. Verify the expected files and one image before starting a long run:
@@ -70,7 +73,7 @@ Do not put a Hugging Face token in a shell command, YAML file, commit, or log. `
 Feature extraction is performed once per backbone. The resulting `.npy` arrays are reused for seeds, evaluation, and LODO probes. This CLIP example extracts all official train and validation images:
 
 ```bash
-python extract_2027_backbone_features.py \
+python src/extract_2027_backbone_features.py \
   --backbone clip_b16 --weights weights/clip_b16 \
   --train-csv ../upar2027_official/data/annotations/task1/train/gt.csv \
   --val-csv ../upar2027_official/data/annotations/task1/val/gt.csv \
@@ -82,7 +85,7 @@ python extract_2027_backbone_features.py \
 Train the 50-epoch LayerNorm + Linear(40) head (weighted BCE by default):
 
 ```bash
-python train_linear_probe_2027.py \
+python src/train_linear_probe_2027.py \
   --cache-dir data/feature_cache_clip_full \
   --output-dir experiments/results/lp_clip_preproj_seed605_50ep \
   --epochs 50 --batch-size 2048 --lr 1e-3 --seed 605
@@ -91,7 +94,7 @@ python train_linear_probe_2027.py \
 The run directory records the best head and `train_summary.json`. Use a new output directory for each run. For held-out-domain evaluation, add the official CSV paths and one `--held-out-domain Market1501`, `PA100k`, or `PETA`; the selected checkpoint is evaluated once on the withheld validation domain:
 
 ```bash
-python train_linear_probe_2027.py \
+python src/train_linear_probe_2027.py \
   --cache-dir data/feature_cache_clip_full \
   --output-dir experiments/results/lodo_clip_preproj_hold_PETA_50ep \
   --epochs 50 --batch-size 2048 --lr 1e-3 --seed 605 \
@@ -107,7 +110,7 @@ Use `evaluate_cached_head.py` to compute per-domain/per-attribute metrics from a
 Fine-tune the last two encoder blocks plus the prediction head. Start with a new run folder:
 
 ```bash
-python train_partial_ft_2027.py \
+python src/train_partial_ft_2027.py \
   --backbone clip_b16 --weights weights/clip_b16 \
   --train-csv ../upar2027_official/data/annotations/task1/train/gt.csv \
   --val-csv ../upar2027_official/data/annotations/task1/val/gt.csv \
@@ -119,7 +122,7 @@ python train_partial_ft_2027.py \
 The script saves `best_model.pth`, predictions, and `last_checkpoint.pth` after each completed epoch. If an interrupted run has a `last_checkpoint.pth`, resume with the same arguments and add `--resume`:
 
 ```bash
-python train_partial_ft_2027.py \
+python src/train_partial_ft_2027.py \
   --backbone clip_b16 --weights weights/clip_b16 \
   --train-csv ../upar2027_official/data/annotations/task1/train/gt.csv \
   --val-csv ../upar2027_official/data/annotations/task1/val/gt.csv \
@@ -130,7 +133,7 @@ python train_partial_ft_2027.py \
 
 ## 6. C²T code and data paths
 
-The original C²T pipeline uses the legacy `data/phase1/annotations/phase1/` and `data/phase2/` layout, a published checkpoint, and additional MMCV dependencies. The local config uses repository-relative paths in `configs/upar_local.yaml`. The faster cached-head workflow is documented in [`FEATURE_CACHE.md`](FEATURE_CACHE.md); it starts from the published checkpoint and freezes the backbone, so it is not an independent end-to-end reproduction. The official 2027 frozen-probe scripts above use the organizer's task 1 CSVs directly.
+The original C²T pipeline uses the legacy `data/phase1/annotations/phase1/` and `data/phase2/` layout, a published checkpoint, and additional MMCV dependencies. The local config uses repository-relative paths in `config/upar_local.yaml`. The faster cached-head workflow is documented in [`FEATURE_CACHE.md`](FEATURE_CACHE.md); it starts from the published checkpoint and freezes the backbone, so it is not an independent end-to-end reproduction. The official 2027 frozen-probe scripts above use the organizer's task 1 CSVs directly.
 
 ## Local performance reference
 

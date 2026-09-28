@@ -1,6 +1,6 @@
 ## Channel-Aware Cross-Fused Transformer-style Networks (C2T-Net)
 
-> **Current 2027 research workflow:** see [RUN_RESEARCH.md](RUN_RESEARCH.md) for the `.venv` setup, organizer data download link/layout, pretrained weights, feature caching, linear probes, partial fine-tuning, and resume instructions. Results/protocol are tracked in [`experiments/README.md`](experiments/README.md).
+> **Current 2027 research workflow:** see [RUN_RESEARCH.md](RUN_RESEARCH.md) for the `.venv` setup, organizer data download link/layout, pretrained weights, feature caching, linear probes, partial fine-tuning, and resume instructions. The new source/data layout and Mermaid diagrams are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Results/protocol are tracked in [`experiments/README.md`](experiments/README.md).
 
 The sections below describe the original C²T-Net code and 2024 workflow. Use the linked research guide for the current 2027 experiments.
 
@@ -62,7 +62,7 @@ Download our best checkpoint [here](https://drive.google.com/file/d/1YCHeRhEPcyb
 Run the below file for inference:
 
 ```
-CUDA_VISIBLE_DEVICES=0 python infer_upar_test_phase.py
+CUDA_VISIBLE_DEVICES=0 python src/infer_upar_test_phase.py
 ```
 
 The results are written in `predictions.csv` file. This file is valid for submission in the codalearn portal.

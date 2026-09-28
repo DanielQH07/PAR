@@ -1,5 +1,5 @@
 experiment_id: lp_siglip2_b16_seed607_50ep
-git_commit: fd31f39f6d7ed8175c5f876af5e3b7f863e8eab2
+git_commit: 1635087e5971c0c73b151f624b13db590f9343fc
 git_dirty: true
 model: SigLIP2-B/16
 model_weights: weights/siglip2_b16

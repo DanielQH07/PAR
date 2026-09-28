@@ -3,19 +3,19 @@
 `train_cached_features.py` extracts the 2,048-dimensional output of the published C2T-Net backbone. It loads the published checkpoint, freezes Swin and EVA, and applies the deterministic validation image transform to both training and validation images. The cache consists of NumPy memory-mapped feature and label arrays, plus the initial classifier weights.
 
 ```bash
-UPAR_SKIP_PRETRAINED=1 ../.conda-upar-exact/bin/python train_cached_features.py extract \
-  --cfg configs/upar_local.yaml --checkpoint checkpoints/best_model.pth \
+UPAR_SKIP_PRETRAINED=1 ../.conda-upar-exact/bin/python src/train_cached_features.py extract \
+  --cfg config/upar_local.yaml --checkpoint checkpoints/best_model.pth \
   --output-dir data/feature_cache_full_amp --batch-size 64 --workers 2 --amp
 
-../.conda-upar-exact/bin/python train_cached_features.py train \
+../.conda-upar-exact/bin/python src/train_cached_features.py train \
   --output-dir data/feature_cache_full_amp --epochs 10 --batch-size 1024 --lr 1e-4
 ```
 
 The best linear head is `data/feature_cache_full_amp/best_cached_head.pth`. Use it with the original backbone for inference:
 
 ```bash
-UPAR_SKIP_PRETRAINED=1 ../.conda-upar-exact/bin/python infer_upar_test_phase.py \
-  --cfg configs/upar_local.yaml --checkpoint checkpoints/best_model.pth \
+UPAR_SKIP_PRETRAINED=1 ../.conda-upar-exact/bin/python src/infer_upar_test_phase.py \
+  --cfg config/upar_local.yaml --checkpoint checkpoints/best_model.pth \
   --head-checkpoint data/feature_cache_full_amp/best_cached_head.pth \
   --batch-size 16 --device cuda --output data/phase2/predictions_cached_head.csv
 ```
