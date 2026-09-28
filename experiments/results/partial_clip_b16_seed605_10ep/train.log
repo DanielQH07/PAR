@@ -1,0 +1,10 @@
+epoch 1: train 117.9s val 29.2s mA 0.8783 F1 0.7682 Avg 0.8232
+epoch 2: train 119.0s val 28.8s mA 0.8855 F1 0.7454 Avg 0.8155
+epoch 3: train 119.0s val 28.6s mA 0.8783 F1 0.8050 Avg 0.8416
+epoch 4: train 119.0s val 28.6s mA 0.8805 F1 0.7995 Avg 0.8400
+epoch 5: train 123.6s val 30.6s mA 0.8801 F1 0.8153 Avg 0.8477
+epoch 6: train 119.8s val 28.5s mA 0.8698 F1 0.8215 Avg 0.8456
+epoch 7: train 119.0s val 28.6s mA 0.8684 F1 0.8307 Avg 0.8496
+epoch 8: train 118.9s val 28.6s mA 0.8639 F1 0.8356 Avg 0.8498
+epoch 9: train 119.0s val 28.6s mA 0.8510 F1 0.8409 Avg 0.8460
+epoch 10: train 118.9s val 28.6s mA 0.8534 F1 0.8404 Avg 0.8469

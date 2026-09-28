@@ -1,0 +1,51 @@
+{
+  "experiment_id": "lp_dinov3_vitb16_seed605",
+  "git_commit": "fd31f39f6d7ed8175c5f876af5e3b7f863e8eab2",
+  "checkpoint_path": "./experiments/results/lp_dinov3_vitb16_seed605/best_head.pth",
+  "head_type": "layernorm_linear",
+  "cache_dir": "./data/feature_cache_dino_full_v2",
+  "val_csv": "../upar2027_official/data/annotations/task1/val/gt.csv",
+  "validation_images": 33407,
+  "evaluation_seconds": 0.07021145336329937,
+  "metrics": {
+    "mA": 0.8344803297976181,
+    "Label_F1": 0.4369696357640298,
+    "Inst_Acc": 0.5235388189467282,
+    "Inst_Prec": 0.5655675173966949,
+    "Inst_Rec": 0.8633191555752696,
+    "Inst_F1": 0.6834205690002908,
+    "Avg": 0.7589504493989545
+  },
+  "domains": {
+    "Market1501": {
+      "images": 16458,
+      "mA": 0.7634120243590916,
+      "Label_F1": 0.4188837574840045,
+      "Inst_Acc": 0.5232755616031481,
+      "Inst_Prec": 0.5583718596763422,
+      "Inst_Rec": 0.8848662549491934,
+      "Inst_F1": 0.6846887029019701,
+      "Avg": 0.7240503636305309
+    },
+    "PA100k": {
+      "images": 9986,
+      "mA": 0.8344968610163643,
+      "Label_F1": 0.43198829178447584,
+      "Inst_Acc": 0.5653996090758782,
+      "Inst_Prec": 0.613985188120886,
+      "Inst_Rec": 0.862968314370277,
+      "Inst_F1": 0.7174901064215035,
+      "Avg": 0.775993483718934
+    },
+    "PETA": {
+      "images": 6963,
+      "mA": 0.7958838369085607,
+      "Label_F1": 0.3932519048149529,
+      "Inst_Acc": 0.4641263299521784,
+      "Inst_Prec": 0.5131371389549013,
+      "Inst_Rec": 0.8128928075610541,
+      "Inst_F1": 0.6291343429231934,
+      "Avg": 0.712509089915877
+    }
+  }
+}

@@ -40,6 +40,15 @@ torch.set_printoptions(precision=10)
 set_seed(605)
 
 
+class CheckpointWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.module = model
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
 def main(cfg, args):
     exp_dir = os.path.join('exp_result', cfg.DATASET.NAME)
     model_dir, _ = get_model_log_path(exp_dir, cfg.NAME)
@@ -47,13 +56,13 @@ def main(cfg, args):
     _, valid_tsfm = get_transform(cfg)
     print(valid_tsfm)
 
-    template_submission_csv = os.path.join(cfg.DATASET.PHASE2_ROOT_PATH, 'submission_templates_test/task1', 'predictions.csv')
+    template_submission_csv = args.template or os.path.join(cfg.DATASET.PHASE2_ROOT_PATH, 'submission_templates_test/task1', 'predictions.csv')
     valid_set = PedesAttrUPARInferTestPhase(cfg=cfg, csv_file=template_submission_csv, transform=valid_tsfm,
                               root_path=cfg.DATASET.PHASE2_ROOT_PATH, target_transform=cfg.DATASET.TARGETTRANSFORM)
 
     valid_loader = DataLoader(
         dataset=valid_set,
-        batch_size=cfg.TRAIN.BATCH_SIZE,
+        batch_size=args.batch_size or cfg.TRAIN.BATCH_SIZE,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
@@ -70,18 +79,22 @@ def main(cfg, args):
     )
     model = FeatClassifier(backbone, classifier)
 
-    if torch.cuda.is_available():
-        model = torch.nn.DataParallel(model).cuda()
+    device = torch.device('cuda' if args.device == 'auto' and torch.cuda.is_available() else 'cpu' if args.device == 'auto' else args.device)
+    model = (torch.nn.DataParallel(model) if device.type == 'cuda' else CheckpointWrapper(model)).to(device)
 
-    model = get_reload_weight(model_dir, model, pth='./checkpoints/best_model.pth')
+    model = get_reload_weight(model_dir, model, pth=os.path.abspath(args.checkpoint))
+    if args.head_checkpoint:
+        head = torch.load(args.head_checkpoint, map_location=device)
+        model.module.classifier.logits[0].load_state_dict(head['classifier'], strict=True)
     # Write results
     model.eval()
-    f = open('./predictions.csv', 'w')
+    f = open(args.output, 'w')
     f.write('# Image,Age-Young,Age-Adult,Age-Old,Gender-Female,Hair-Length-Short,Hair-Length-Long,Hair-Length-Bald,UpperBody-Length-Short,UpperBody-Color-Black,UpperBody-Color-Blue,UpperBody-Color-Brown,UpperBody-Color-Green,UpperBody-Color-Grey,UpperBody-Color-Orange,UpperBody-Color-Pink,UpperBody-Color-Purple,UpperBody-Color-Red,UpperBody-Color-White,UpperBody-Color-Yellow,UpperBody-Color-Other,LowerBody-Length-Short,LowerBody-Color-Black,LowerBody-Color-Blue,LowerBody-Color-Brown,LowerBody-Color-Green,LowerBody-Color-Grey,LowerBody-Color-Orange,LowerBody-Color-Pink,LowerBody-Color-Purple,LowerBody-Color-Red,LowerBody-Color-White,LowerBody-Color-Yellow,LowerBody-Color-Other,LowerBody-Type-Trousers&Shorts,LowerBody-Type-Skirt&Dress,Accessory-Backpack,Accessory-Bag,Accessory-Glasses-Normal,Accessory-Glasses-Sun,Accessory-Hat\n')
     with torch.no_grad():
         for step, (imgs, imgnames) in enumerate(tqdm(valid_loader)):
-            imgs = imgs.cuda()
-            valid_logits, attns = model(imgs)
+            imgs = imgs.to(device)
+            with torch.cuda.amp.autocast(enabled=args.amp and device.type == 'cuda'):
+                valid_logits, attns = model(imgs)
             valid_probs = torch.sigmoid(valid_logits[0])
             for imgname, valid_prob in zip(imgnames, valid_probs):
                 write_score = ','.join(list(map(str, valid_prob.tolist())))
@@ -98,6 +111,13 @@ def argument_parser():
         "--cfg", default='./configs/upar.yaml', help="decide which cfg to use", type=str,
     )
     parser.add_argument("--debug", type=str2bool, default="true")
+    parser.add_argument("--checkpoint", default='./checkpoints/best_model.pth')
+    parser.add_argument("--head-checkpoint", default=None)
+    parser.add_argument("--template", default=None)
+    parser.add_argument("--output", default='./predictions.csv')
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--device", choices=['auto', 'cpu', 'cuda'], default='auto')
+    parser.add_argument("--amp", action='store_true', help='Use CUDA mixed precision for faster inference')
 
     args = parser.parse_args()
 

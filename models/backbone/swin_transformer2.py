@@ -2,6 +2,7 @@ import warnings
 from collections import OrderedDict
 from copy import deepcopy
 import logging
+import os
 
 import math 
 from typing import Sequence
@@ -1313,7 +1314,7 @@ class SwinTransformer(BaseModule):
             layer_name = f'norm{i}'
             self.add_module(layer_name, layer)
 
-        self.vit = timm.create_model('eva_large_patch14_196.in22k_ft_in1k', img_size=(256, 128), pretrained=True, num_classes=0)
+        self.vit = timm.create_model('eva_large_patch14_196.in22k_ft_in1k', img_size=(256, 128), pretrained=os.environ.get('UPAR_SKIP_PRETRAINED') != '1', num_classes=0)
         self.norm_1 = nn.LayerNorm(1024)
         self.norm_2 = nn.LayerNorm(1024)
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -1469,6 +1470,8 @@ class SwinTransformer(BaseModule):
 
 @BACKBONE.register("swin_b")
 def swin_base_patch4_window7_224(pretrained='./pretrained/swin_base_patch4_window7_224_22k.pth', convert_weights=True, img_size=224,drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0., **kwargs):
+    if os.environ.get('UPAR_SKIP_PRETRAINED') == '1':
+        pretrained = None
     model = SwinTransformer(pretrained=pretrained, convert_weights=convert_weights, pretrain_img_size = img_size, patch_size=4, window_size=7, embed_dims=128, depths=(2, 2, 18, 2), num_heads=(4, 8, 16, 32), drop_path_rate=drop_path_rate, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, **kwargs)
     return model
 

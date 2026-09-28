@@ -1,0 +1,52 @@
+{
+  "experiment_id": "lp_c2t_fused_seed607_50ep",
+  "git_commit": "fd31f39f6d7ed8175c5f876af5e3b7f863e8eab2",
+  "checkpoint_path": "./experiments/results/lp_c2t_fused_seed607_50ep/best_head.pth",
+  "head_type": "layernorm_linear",
+  "feature_slice": "all",
+  "cache_dir": "./data/feature_cache_2027_full_amp",
+  "val_csv": "../upar2027_official/data/annotations/task1/val/gt.csv",
+  "validation_images": 33407,
+  "evaluation_seconds": 0.13675845321267843,
+  "metrics": {
+    "mA": 0.9056447415176677,
+    "Label_F1": 0.6572990832969007,
+    "Inst_Acc": 0.786300944331843,
+    "Inst_Prec": 0.8327825724928128,
+    "Inst_Rec": 0.9211339886901895,
+    "Inst_F1": 0.8747329829585233,
+    "Avg": 0.8901888622380956
+  },
+  "domains": {
+    "Market1501": {
+      "images": 16458,
+      "mA": 0.8189792300987705,
+      "Label_F1": 0.5989926905226962,
+      "Inst_Acc": 0.7990677561338709,
+      "Inst_Prec": 0.8494758033584136,
+      "Inst_Rec": 0.9194638300088538,
+      "Inst_F1": 0.8830852799300819,
+      "Avg": 0.8510322550144263
+    },
+    "PA100k": {
+      "images": 9986,
+      "mA": 0.9076930077534205,
+      "Label_F1": 0.6176209721646787,
+      "Inst_Acc": 0.7588712360612138,
+      "Inst_Prec": 0.8050937260105095,
+      "Inst_Rec": 0.9157441449775717,
+      "Inst_F1": 0.8568615070389834,
+      "Avg": 0.882277257396202
+    },
+    "PETA": {
+      "images": 6963,
+      "mA": 0.9133094625687012,
+      "Label_F1": 0.6426335468705817,
+      "Inst_Acc": 0.7954632132034113,
+      "Inst_Prec": 0.8330358580574005,
+      "Inst_Rec": 0.9328114913315259,
+      "Inst_F1": 0.8801048645071904,
+      "Avg": 0.8967071635379458
+    }
+  }
+}

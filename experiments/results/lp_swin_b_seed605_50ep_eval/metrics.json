@@ -1,0 +1,51 @@
+{
+  "experiment_id": "lp_swin_b_seed605_50ep",
+  "git_commit": "fd31f39f6d7ed8175c5f876af5e3b7f863e8eab2",
+  "checkpoint_path": "./experiments/results/lp_swin_b_seed605_50ep/best_head.pth",
+  "head_type": "layernorm_linear",
+  "cache_dir": "./data/feature_cache_swin_full",
+  "val_csv": "../upar2027_official/data/annotations/task1/val/gt.csv",
+  "validation_images": 33407,
+  "evaluation_seconds": 0.0846029631793499,
+  "metrics": {
+    "mA": 0.8384551605283013,
+    "Label_F1": 0.477548904100254,
+    "Inst_Acc": 0.5748141395239453,
+    "Inst_Prec": 0.6291090982501456,
+    "Inst_Rec": 0.8517728288015952,
+    "Inst_F1": 0.7237012302637478,
+    "Avg": 0.7810781953960245
+  },
+  "domains": {
+    "Market1501": {
+      "images": 16458,
+      "mA": 0.7743645553617478,
+      "Label_F1": 0.44496827101703584,
+      "Inst_Acc": 0.5896454146767967,
+      "Inst_Prec": 0.6387639479088202,
+      "Inst_Rec": 0.8712411009211958,
+      "Inst_F1": 0.7371066813797097,
+      "Avg": 0.7557356183707287
+    },
+    "PA100k": {
+      "images": 9986,
+      "mA": 0.8272310514038604,
+      "Label_F1": 0.4657346678972784,
+      "Inst_Acc": 0.6023770105088672,
+      "Inst_Prec": 0.6620324898904616,
+      "Inst_Rec": 0.8523463006939874,
+      "Inst_F1": 0.7452309121149139,
+      "Avg": 0.7862309817593871
+    },
+    "PETA": {
+      "images": 6963,
+      "mA": 0.7859386513387535,
+      "Label_F1": 0.41866999852445613,
+      "Inst_Acc": 0.5002290531931893,
+      "Inst_Prec": 0.5590713983215714,
+      "Inst_Rec": 0.8049344670520887,
+      "Inst_F1": 0.6598444324559577,
+      "Avg": 0.7228915418973556
+    }
+  }
+}

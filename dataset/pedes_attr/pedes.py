@@ -185,9 +185,12 @@ class PedesAttrUPAR(data.Dataset):
         self.transform = transform
         self.data = pd.read_csv(csv_file)
         self.root_path = root_path
-        if train:
+        # The older phase-1 train CSV omits the image column name. Pandas
+        # consequently puts image paths in the index; restore that column
+        # without dropping any data rows.
+        if train and self.data.columns[0] != '# image':
             self.data.reset_index(inplace=True)
-            self.data = pd.DataFrame(self.data.values[1:], columns=["# image"] + self.data.columns.to_list()[1:])
+            self.data.rename(columns={'index': '# image'}, inplace=True)
         
         self.label = self.data.values[:, 1:].astype(np.float32)
         self.attr_num = self.label.shape[-1]

@@ -17,7 +17,7 @@ from metrics.ml_metrics import get_multilabel_metrics
 from metrics.pedestrian_metrics import get_pedestrian_metrics
 from models.model_ema import ModelEmaV2
 from optim.adamw import AdamW
-from scheduler.cosine_lr import CosineLRScheduler
+from timm.scheduler.cosine_lr import CosineLRScheduler
 from tools.distributed import distribute_bn
 from tools.vis import tb_visualizer_pedes
 import torch
@@ -71,7 +71,8 @@ def main(cfg, args):
         print(f"seed: {seed}")
         ReDirectSTD(stdout_file, 'stdout', False)
 
-    gen_code_archive(out_dir=os.path.join(exp_dir, cfg.BACKBONE.TYPE+cfg.NAME), file=f'code_{timestamp}.tar.gz')
+    if os.environ.get('UPAR_SKIP_ARCHIVE') != '1':
+        gen_code_archive(out_dir=os.path.join(exp_dir, cfg.BACKBONE.TYPE+cfg.NAME), file=f'code_{timestamp}.tar.gz')
 
     """
     the reason for args usage is CfgNode is immutable
@@ -350,7 +351,7 @@ def trainer(cfg, args, epoch, model, model_ema, train_loader, valid_loader, crit
                 print(f'{time_str()}')
                 print('-' * 60)
 
-            if args.local_rank == 0:
+            if args.local_rank == 0 and tb_writer is not None:
                 tb_visualizer_pedes(tb_writer, lr, e, train_loss, valid_loss, train_result, valid_result,
                                     train_gt, valid_gt, train_loss_mtr, valid_loss_mtr, model)
 

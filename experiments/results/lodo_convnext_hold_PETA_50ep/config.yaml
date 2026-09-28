@@ -1,0 +1,15 @@
+experiment_id: lodo_convnext_hold_PETA_50ep
+git_commit: fd31f39f6d7ed8175c5f876af5e3b7f863e8eab2
+git_dirty: true
+cache_dir: feature_cache_convnext_full
+held_out_domain: PETA
+model_selection: source-domain validation Avg
+target_evaluation: held-out domain validation
+head: LayerNorm -> Linear(40)
+loss: weighted_bce
+lr: 0.001
+batch_size: 2048
+epochs: 50
+seed: 605
+best_epoch: 38
+threshold: 0.5

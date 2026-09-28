@@ -1,5 +1,9 @@
 ## Channel-Aware Cross-Fused Transformer-style Networks (C2T-Net)
 
+> **Current 2027 research workflow:** see [RUN_RESEARCH.md](RUN_RESEARCH.md) for the `.venv` setup, organizer data download link/layout, pretrained weights, feature caching, linear probes, partial fine-tuning, and resume instructions. Results/protocol are tracked in [`experiments/README.md`](experiments/README.md).
+
+The sections below describe the original C²T-Net code and 2024 workflow. Use the linked research guide for the current 2027 experiments.
+
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/c2t-net-channel-aware-cross-fused-transformer/pedestrian-attribute-recognition-on-pa-100k)](https://paperswithcode.com/sota/pedestrian-attribute-recognition-on-pa-100k?p=c2t-net-channel-aware-cross-fused-transformer)
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/c2t-net-channel-aware-cross-fused-transformer/pedestrian-attribute-recognition-on-peta)](https://paperswithcode.com/sota/pedestrian-attribute-recognition-on-peta?p=c2t-net-channel-aware-cross-fused-transformer)
 

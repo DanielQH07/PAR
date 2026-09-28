@@ -1,2 +1,3 @@
-# for single gpu
-CUDA_VISIBLE_DEVICES=1 python3.8 train2.py --cfg ./configs/pa100k.yaml
+#!/usr/bin/env bash
+set -e
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python train_upar_2024.py --cfg "${UPAR_CFG:-./configs/upar.yaml}"

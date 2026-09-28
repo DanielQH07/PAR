@@ -1,0 +1,15 @@
+experiment_id: lodo_siglip2_hold_Market1501_50ep
+git_commit: fd31f39f6d7ed8175c5f876af5e3b7f863e8eab2
+git_dirty: true
+cache_dir: feature_cache_siglip2_full
+held_out_domain: Market1501
+model_selection: source-domain validation Avg
+target_evaluation: held-out domain validation
+head: LayerNorm -> Linear(40)
+loss: weighted_bce
+lr: 0.001
+batch_size: 2048
+epochs: 50
+seed: 605
+best_epoch: 41
+threshold: 0.5
