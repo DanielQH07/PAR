@@ -15,3 +15,31 @@ data/*
 experiments/results/**/*.pth
 experiments/results/**/*.npy
 experiments/results/smoke_*/
+CLAUDE.md
+.claude/
+/builds/
+/research/
+/server_mirror/
+
+# research artefacts that stay local (logs/metrics are mirrored from the server; checkpoints live there)
+/weights_own/
+/sim/
+/runs/
+ONBOARDING.md
+# internal research log / ops tooling (not part of the shared code)
+/src/sync_from_server.sh
+/src/push_to_drive.sh
+/src/v6_pipeline.sh
+/src/v7_pipeline.sh
+/docs/analysis/
+# workspace links used by the scripts (point them at your own data)
+/ann
+/images
+/tokenizer_clip
+/experiments/results/
+/docs/RESEARCH_BRIEF_weaknesses.md
+/.autoresearch_git_backup/
+# internal research workspace (notes, queues, one-off probes) and run outputs
+/autoresearch/
+/logs/
+/docs/METHOD_2027.md

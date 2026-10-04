@@ -1,90 +1,99 @@
-## Channel-Aware Cross-Fused Transformer-style Networks (C2T-Net)
+# UPAR 2027 Track 1: pedestrian attribute recognition under domain shift
 
-> **Current 2027 research workflow:** see [RUN_RESEARCH.md](RUN_RESEARCH.md) for the `.venv` setup, organizer data download link/layout, pretrained weights, feature caching, linear probes, partial fine-tuning, and resume instructions. The new source/data layout and Mermaid diagrams are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Results/protocol are tracked in [`experiments/README.md`](experiments/README.md).
+Code for our entry to the [UPAR Challenge 2027, Track 1](https://www.codabench.org/competitions/18180/) (WACV 2027 RWS
+workshop). The task is to predict 40 binary attributes for each pedestrian crop. The model trains on Market1501, PA100k
+and PETA and is tested on two unseen domains, **MEVID** (surveillance video) and a **synthetic** set. Score:
+`Challenge_Avg` = harmonic mean of mA and instance F1, averaged over the two test sets. The submission is code that
+runs on a **CPU-only** scorer within **3600 s** for about 29k images.
 
-The sections below describe the original C²T-Net code and 2024 workflow. Use the linked research guide for the current 2027 experiments.
+## How we approached it
 
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/c2t-net-channel-aware-cross-fused-transformer/pedestrian-attribute-recognition-on-pa-100k)](https://paperswithcode.com/sota/pedestrian-attribute-recognition-on-pa-100k?p=c2t-net-channel-aware-cross-fused-transformer)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/c2t-net-channel-aware-cross-fused-transformer/pedestrian-attribute-recognition-on-peta)](https://paperswithcode.com/sota/pedestrian-attribute-recognition-on-peta?p=c2t-net-channel-aware-cross-fused-transformer)
+1. **Measure what the leaderboard measures.** The test domains are hidden, so every idea is scored with
+   leave-one-domain-out (LODO): train on two source datasets, test on the third, three folds. Scoring runs the exact
+   submission path (one model, contextual calibration, Codabench metric). In-domain validation over-estimates by
+   about 0.08 and ranks ideas wrongly. The Market1501 fold (re-ID crops, many cameras) tracks MEVID best.
+2. **Fit the CPU budget first.** On the scorer, one ViT-B/16 at 256x128 takes 1900-3200 s, so the submission is
+   always one ViT-B: no ensemble, no TTA, no bigger input, fp32. Everything else (teachers, extra losses) is
+   training-only.
+3. **Pick the backbone by LODO.** Fine-tuning web-scale image-text models generalises best. MetaCLIP B/16 beat
+   OpenAI CLIP, DFN-2B, SigLIP 2 (FixRes and NaFlex), CLIP ViT-L/14 and PE-Core B/16.
+4. **Find the right amount of fine-tuning.** We scored the held-out fold after every epoch and found that it peaks
+   after about 2 epochs (~180k images) and then falls, while in-domain validation keeps rising. Longer training fits
+   the source datasets' labelling conventions (for example, faded jeans called blue in one dataset and grey in
+   another), and this did not change with LoRA or noisy-label losses. We fix the length (`--ft-samples`) instead of
+   choosing an epoch on validation. This gave the largest single gain on the leaderboard.
+5. **Diagnose before adding things.** Error decomposition on held-out folds (`src/error_anatomy.py`)
+   showed that we lose to the top team on instance precision, not on mA. Most errors come from colour naming
+   conflicts between datasets and from small accessories. More than 60 ideas were tested on LODO (heads, losses,
+   layer schedules, LoRA, augmentation, crowd layers, feature distillation). Most traded mA for F1 one-for-one, so
+   the harmonic mean did not move. Logit distillation from an ensemble of two different backbones (MetaCLIP + PE-Core)
+   raised precision without losing mA.
 
-<img src="https://caodoanh2001.github.io/assets/img/upar-certificate.jpg" data-canonical-src="https://caodoanh2001.github.io/assets/img/upar-certificate.jpg" width="750" height="500" />
+Final recipe: MetaCLIP ViT-B/16, input 256x128 with aspect-preserving padding, full fine-tune with layer-wise lr
+decay 0.8, EMA 0.999, BCE with pos_weight (neg/pos)^0.5 and label smoothing 0.1, domain-balanced sampling,
+unannotated (domain, attribute) pairs masked, 2 epochs, weight soup of 3 seeds, contextual calibration (λ 0.1) at
+inference.
 
-Doanh C. Bui, Thinh V. Le and Hung Ba Ngo
+## Quick start
 
-### 1. Prepare the dataset from UPAR challenge
+```bash
+# 1. environment + data: RUN_RESEARCH.md sections 1-2, then point the scripts at the data
+ln -s data/annotations/task1 ann && ln -s data/phase1 images
+python src/download_weights.py                       # MetaCLIP, OpenAI CLIP, PE-Core
 
-Follow the instruction of data download of organizer [website](https://github.com/speckean/upar_challenge).
+# 2. score a recipe on the 3 LODO folds (one GPU, ~45 min)
+bash src/job.sh MYRUN --weights weights_own/metaclip_b16 --unfreeze 12 --llrd 0.8 --ft-samples 180000
 
-The data should be arranged as below tree directory:
-
-```
-data
-├── phase1
-│   ├── annotations
-│   ├── Market1501
-│   ├── market_1501.zip
-│   ├── PA100k
-│   └── PETA
-├── phase2
-│   ├── annotations
-│   ├── MEVID
-│   └── submission_templates_test
-```
-
-### 2. Prepare docker image
-
-Download docker image [here](https://drive.google.com/file/d/1sht0y_6lhzP1IAwUb_CRNtuZom6JZnkx/view).
-
-Run the below command to load the docker image:
-
-```
-sudo docker load < upar_hdt.tar
-```
-
-Go into the `data` folder, run below command to create a container
-
-```
-sudo docker run -d --shm-size 8G --gpus="all" -it --name upar_hdt --mount type=bind,source="$(pwd)",target=/home/data upar_hdt:v0
-```
-
-Run the container
-
-```
-sudo docker exec -ti upar_hdt /bin/bash
+# 3. build a submission zip (3 seeds + soup + packaging + Docker CPU check) -> builds/ensemble_final.zip
+WEIGHTS=weights_own/metaclip_b16 NAME=final \
+  V8_ARGS="--unfreeze 12 --llrd 0.8 --ft-samples 180000 --exact-samples --train-on-val" bash src/v8_pipeline.sh
 ```
 
-Then, follow the step 3 for reproducing the results, and step 4 for training.
-
-### 3. Inference for testing dataset in phase 2:
-
-Download our best checkpoint [here](https://drive.google.com/file/d/1YCHeRhEPcyb6fD9byi3flNFSQDsY2qA0/view?usp=drive_link) (`best_model.pth`). Place it under `checkpoints` folder (we already put it in the docker image).
-
-Run the below file for inference:
+### Where things are
 
 ```
-CUDA_VISIBLE_DEVICES=0 python src/infer_upar_test_phase.py
+src/
+├── download_weights.py     # MetaCLIP B/16, OpenAI CLIP B/16, PE-Core B/16 (~1.3 GB) -> weights/, weights_own/
+├── train.py                # one training run; every option, including those that did not help (--help)
+├── prepare.py              # fixed held-out scorer: single model, contextual calibration, Codabench metric
+├── job.sh                  # one recipe on the 3 LODO folds -> logs/<RUN>.<fold>.log, runs/lodo/<RUN>/<fold>/probe.npz
+├── v8_pipeline.sh          # 3 seeds on all data + weight soup + packaging + Docker CPU check -> builds/ensemble_<NAME>.zip
+├── package_submission.py   # builds the Codabench zip
+├── clip_vit.py             # dependency-free CLIP / SigLIP vision tower, shared by training and the submission
+├── robust2.py, metric_split.py, error_anatomy.py, layer_drift.py   # analysis of held-out probes
+└── ...                     # earlier 2027 baselines and legacy C2T-Net code
+submission/task1/
+├── run.py                  # submission runtime: batching, time budget, calibration
+├── metadata.yaml
+└── assets/attribute_prior.json
 ```
 
-The results are written in `predictions.csv` file. This file is valid for submission in the codalearn portal.
+Scripts call `python`; set `PY=/path/to/python` for another interpreter. Upload `builds/ensemble_<NAME>.zip` to
+Codabench as is (torch, numpy and Pillow only).
 
+Comparing runs on the held-out probes (`robust2` drops attributes with < 20 source or < 50 held-out positives):
 
-### 3. Training model
-
-Run the below command for training:
-
+```bash
+PYTHONPATH=src python src/robust2.py                         # edit `tags` inside: robust and robust2 per fold
+PYTHONPATH=src python src/metric_split.py RUN_A RUN_B         # mA vs instance F1 / precision / recall
+PYTHONPATH=src python src/error_anatomy.py RUN Market1501     # per-attribute FP/FN and colour confusions
 ```
-CUDA_VISIBLE_DEVICES=0 bash run.sh
-```
 
-The checkpoints and logs would be saved at `exp_results/upar/`
+Tried on LODO without a gain: SigLIP 2 (FixRes, NaFlex), DFN, ViT-L, PE-Core alone, LoRA, reverse layer-wise lr,
+frozen top blocks, focal loss, lower pos_weight, crowd layer, colour-group CE, ELR, Lipsum-FT, two-view consistency,
+MixStyle, intermediate CLS fusion, attribute and query heads, same-person consistency, token-level feature
+distillation, longer training (with or without val data).
 
-If this repository proves beneficial for your projects, we kindly request acknowledgment through proper citation:
+## Legacy: C²T-Net (UPAR 2024)
+
+This repository started from C²T-Net (Swin + EVA ViT, a UPAR 2024 Track 1 entry). Its training and inference
+(`run.sh`, `src/infer_upar*.py`) are kept for reference.
+
 ```
 @InProceedings{Bui_2024_WACV,
     author    = {Bui, Doanh C. and Le, Thinh V. and Ngo, Ba Hung},
     title     = {C2T-Net: Channel-Aware Cross-Fused Transformer-Style Networks for Pedestrian Attribute Recognition},
     booktitle = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV) Workshops},
-    month     = {January},
     year      = {2024},
     pages     = {351-358}
 }

@@ -26,6 +26,28 @@ def score(labels, probabilities, threshold=0.5):
     }
 
 
+def challenge_score(labels, probabilities, domains, threshold=0.5, exclude_invalid=True):
+    """Codabench 2027 ranking: per-domain harmonic mean of mA and Inst_F1, averaged
+    over domains. By default attributes without positives in a domain are treated as invalid
+    (unannotated in that source dataset) and excluded for that domain; the organisers' exact
+    rule is unknown, so pass exclude_invalid=False to score all 40 attributes."""
+    domains = np.asarray(domains)
+    per_domain = {}
+    for domain in sorted(set(domains.tolist())):
+        mask = domains == domain
+        y, p = labels[mask], probabilities[mask]
+        valid = np.flatnonzero(y.sum(axis=0) > 0) if exclude_invalid else np.arange(y.shape[1])
+        result = get_pedestrian_metrics(y, p, threshold=threshold, index=valid)
+        ma, f1 = float(result.ma), float(result.instance_f1)
+        per_domain[domain] = {'images': int(mask.sum()), 'mA': ma, 'Inst_F1': f1,
+                              'Inst_Prec': float(result.instance_prec),
+                              'Inst_Rec': float(result.instance_recall),
+                              'Challenge_Avg': 2 * ma * f1 / max(ma + f1, 1e-12)}
+    keys = ('mA', 'Inst_F1', 'Inst_Prec', 'Inst_Rec', 'Challenge_Avg')
+    summary = {key: float(np.mean([d[key] for d in per_domain.values()])) for key in keys}
+    return {**summary, 'domains': per_domain}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cache-dir', type=Path, required=True)

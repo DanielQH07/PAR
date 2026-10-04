@@ -119,7 +119,8 @@ def main():
         mean = [mean] * 3
     if isinstance(std, (int, float)):
         std = [std] * 3
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available()
+                          else 'mps' if torch.backends.mps.is_available() else 'cpu')
     torch.set_float32_matmul_precision('high')
     model, extract, dimension = load_model(args.backbone, args.weights, device)
     metadata = {'backbone': args.backbone, 'weights': str(args.weights.resolve()),
