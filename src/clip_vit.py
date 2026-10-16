@@ -114,7 +114,7 @@ class MAPHead(nn.Module):
         self.mlp = MLP(width)
 
     def forward(self, x):
-        h = self.attention(self.probe.expand(len(x), -1, -1).to(x.dtype), x, x, need_weights=False)[0]
+        h = self.attention(self.probe.expand(x.shape[0], -1, -1).to(x.dtype), x, x, need_weights=False)[0]
         return (h + self.mlp(self.layernorm(h)))[:, 0]
 
 

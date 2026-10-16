@@ -25,6 +25,7 @@ Checkpoints are selected with the Codabench metric on source-domain validation (
 import argparse
 import copy
 import csv
+import io
 import json
 import math
 import random
@@ -78,7 +79,7 @@ class Images(Dataset):
         self.std = torch.tensor(CLIP_STD).view(3, 1, 1)
         self.pad = tuple(round(c * 255) for c in CLIP_MEAN)
         self.groups = None
-        self.wb, self.gamma = 0.0, 0.0  # W1: camera colour-cast / exposure jitter (training only)
+        self.wb, self.gamma, self.jpeg_prob = 0.0, 0.0, 0.0
 
     def set_identity_pairs(self):
         """P1-id: Market file names carry the person id; each item also returns another image of the same person."""
@@ -131,6 +132,12 @@ class Images(Dataset):
                 image = image.resize(small, Image.Resampling.BILINEAR)
             if strong and random.random() < 0.2:
                 image = image.filter(ImageFilter.GaussianBlur(random.uniform(0.3, 1.2)))
+            if strong and random.random() < self.jpeg_prob:
+                buffer = io.BytesIO()
+                image.save(buffer, format='JPEG', quality=random.randint(35, 75), subsampling=0)
+                buffer.seek(0)
+                with Image.open(buffer) as compressed:
+                    image = compressed.convert('RGB')
             scale = min(w / image.width, h / image.height)
             new = (min(w, max(1, round(image.width * scale))), min(h, max(1, round(image.height * scale))))
             image = image.resize(new, Image.Resampling.BICUBIC)
@@ -281,10 +288,10 @@ class TimmPEVision(torch.nn.Module):
     """P1-pe: Perception Encoder PE-Core B/16 (timm EVA with 2D RoPE, MAP pooling) with the CLIPVision interface;
     training only (a submission would ship it as TorchScript). Inputs stay CLIP-normalised, re-normalised to 0.5/0.5."""
 
-    def __init__(self, size):
+    def __init__(self, size, name='vit_pe_core_base_patch16_224'):
         super().__init__()
         import timm
-        self.m = timm.create_model('vit_pe_core_base_patch16_224', pretrained=False, img_size=tuple(size), num_classes=1024)
+        self.m = timm.create_model(name, pretrained=False, img_size=tuple(size), num_classes=1024)
         self.layers, self.post_layernorm = self.m.blocks, self.m.norm
         self.visual_projection = torch.nn.Identity()
         self.head = torch.nn.ModuleList([self.m.attn_pool, self.m.fc_norm])
@@ -330,6 +337,10 @@ class PARPlus(PARModel):
             from clip_vit import AttributeHead
             self.vision = TimmPEVision(size)
             self.head = AttributeHead(head, embed=768)
+        elif arch == 'pel':  # PE-Core L/14 (24 blocks, width 1024); use --size 252 126
+            from clip_vit import AttributeHead
+            self.vision = TimmPEVision(size, 'vit_pe_core_large_patch14_336')
+            self.head = AttributeHead(head, width=1024, embed=1024)
         elif arch == 'siglip':  # S1: SigLIP 2 ViT-B/16 (attention-pooling head, no CLS)
             from clip_vit import AttributeHead, SiglipVision
             self.vision = SiglipVision(size)
@@ -342,6 +353,16 @@ class PARPlus(PARModel):
         self.mixstyle_layers, self.mixstyle_p = (), 0.5
         self.fuse_layers, self.fuse = (), None
         self.attr_from = None
+        self.pseudo_word = None
+
+    def set_pseudo_word(self, text):
+        """JGEL ablation: an image-conditioned pseudo word scores fixed attribute text embeddings."""
+        width = self.head.net[0].normalized_shape[0] if self.head.kind == 'linear' else text.shape[1]
+        self.pseudo_word = torch.nn.Sequential(torch.nn.LayerNorm(width),
+                                               torch.nn.Linear(width, 512), torch.nn.GELU(),
+                                               torch.nn.Linear(512, text.shape[1]))
+        self.register_buffer('pseudo_text', torch.nn.functional.normalize(text.float(), dim=-1))
+        self.pseudo_gate = torch.nn.Parameter(torch.zeros(len(text)))
 
     def set_attr_tokens(self, k, text=None):
         """V1 (VTB / PromptPAR-like image-text fusion): 40 attribute tokens join the last k blocks. Image tokens do not
@@ -404,6 +425,9 @@ class PARPlus(PARModel):
             z = z + self.fuse(torch.cat(mids, -1))
         if a is not None:
             z = z + (self.vision.post_layernorm(a) * self.attr_w).sum(-1) + self.attr_b
+        if self.pseudo_word is not None:
+            word = torch.nn.functional.normalize(self.pseudo_word(self.last_embed), dim=-1)
+            z = z + (word @ self.pseudo_text.T) * self.pseudo_gate
         return self.softcap * torch.tanh(z / self.softcap) if self.softcap else z
 
 
@@ -586,9 +610,13 @@ def main():
     p.add_argument('--teacher', nargs='+', help="B2: run dir of a frozen teacher (best_ema.pth + metrics.json); '{held}' is "
                    'replaced by the held-out domain, e.g. runs/lodo/B1l14/{held}')
     p.add_argument('--kd-weight', type=float, default=0.25, help='B2: weight of MSE(student logits, teacher logits)')
+    p.add_argument('--kd-loss', choices=('mse', 'bernoulli-kl'), default='mse',
+                   help='teacher loss; Bernoulli KL matches each independent attribute probability')
     p.add_argument('--fuse', type=int, nargs='*', default=(), help='F1: also use CLS of these blocks (1-based), zero-init head')
     p.add_argument('--attr-tokens', type=int, default=0, help='V1: 40 attribute tokens in the last k blocks')
     p.add_argument('--attr-text', type=Path, help='V1: full HF CLIP dir whose text tower initialises the tokens')
+    p.add_argument('--pseudo-word-text', type=Path,
+                   help='JGEL: HF CLIP dir providing fixed attribute text embeddings for a joint pseudo-word residual')
     p.add_argument('--pk', type=int, nargs=2, metavar=('P', 'K'),
                    help='Q1 stage 2: batches of P Market people x K images + P*K domain-balanced images')
     p.add_argument('--init-from', help='Q1 stage 2: checkpoint to start from ({held} = held-out domain)')
@@ -596,6 +624,8 @@ def main():
                    help='F1: set the number of fine-tuning epochs to round(ft_samples / training images)')
     p.add_argument('--wb-jitter', type=float, default=0.0, help='W1: per-channel gain jitter +-a (camera white balance)')
     p.add_argument('--gamma-jitter', type=float, default=0.0, help='W1: gamma = exp(U(-b, b)) (exposure)')
+    p.add_argument('--jpeg-prob', type=float, default=0.0,
+                   help='training-only JPEG recompression probability (quality 35-75, full chroma)')
     p.add_argument('--exact-samples', action='store_true',
                    help='T1: with --ft-samples, stop after exactly that many images (truncate the last epoch)')
     p.add_argument('--id-proto', type=float, default=0.0,
@@ -606,7 +636,7 @@ def main():
                    help='C1: weight of MSE between logits of two differently augmented views (2x compute)')
     p.add_argument('--mixstyle', type=int, nargs='*', default=(), help='MixStyle after these block indices (1-based), p 0.5')
     p.add_argument('--llrd', type=float, default=1.0, help='layer-wise lr decay per block below the top (1 = off)')
-    p.add_argument('--arch', choices=('b16', 'l14', 'siglip', 'pe'), default='b16', help='l14: CLIP ViT-L/14 (teacher experiments)')
+    p.add_argument('--arch', choices=('b16', 'l14', 'siglip', 'pe', 'pel'), default='b16', help='l14: CLIP ViT-L/14 (teacher experiments)')
     p.add_argument('--muon', action='store_true', help='Muon for the unfrozen 2-D backbone weights (AdamW for the rest)')
     p.add_argument('--softcap', type=float, default=0.0, help='logit soft-capping c; 0 = off')
     p.add_argument('--unfreeze', type=int, default=4, help='number of last blocks to train')
@@ -708,6 +738,7 @@ def main():
                      multiprocessing_context='spawn' if args.workers else None)
     train_set = Images(train_rows, args.image_root, size, True, args.aug)
     train_set.wb, train_set.gamma = args.wb_jitter, args.gamma_jitter
+    train_set.jpeg_prob = args.jpeg_prob
     if args.elr:  # L2: early-learning regularisation (Liu et al., NeurIPS 2020), binary per attribute
         train_set.with_index = True
         elr_t = torch.zeros(len(train_rows), 40, device=device)
@@ -762,6 +793,8 @@ def main():
     if args.attr_tokens:
         text = text_embeddings(args.attr_text, args.tokenizer or args.attr_text, names) if args.attr_text else None
         model.set_attr_tokens(args.attr_tokens, text)
+    if args.pseudo_word_text:
+        model.set_pseudo_word(text_embeddings(args.pseudo_word_text, args.tokenizer or args.pseudo_word_text, names))
     if args.domain_tags:
         model.domain_bias = torch.nn.Parameter(torch.zeros(GENERIC + 1, 40))
     colour_groups = [[i for i, n in enumerate(names) if n.startswith(part + '-Color')]
@@ -795,6 +828,7 @@ def main():
     head_params = (list(model.head.parameters()) + (list(model.extra.parameters()) if model.extra else [])
                    + (list(model.fuse.parameters()) if model.fuse is not None else [])
                    + ([model.attr_tokens, model.attr_w, model.attr_b] if args.attr_tokens else [])
+                   + (list(model.pseudo_word.parameters()) + [model.pseudo_gate] if model.pseudo_word is not None else [])
                    + (list(model.adaptor.parameters()) if feat_teacher is not None else []) + ([model.domain_bias] if args.domain_tags else [])
                    + ([model.crowd] if args.crowd_colors else []))
     muon_params = [q for q in backbone_params if q.ndim == 2] if args.muon else []
@@ -962,7 +996,9 @@ def main():
                 with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
                     t_logits = sum(t(x if ts == size else torch.nn.functional.interpolate(
                         x, size=ts, mode='bilinear', align_corners=False)).float() for t, ts in teachers) / len(teachers)
-                loss = loss + args.kd_weight * (logits - t_logits).pow(2).mean()
+                kd = ((logits - t_logits).pow(2).mean() if args.kd_loss == 'mse' else
+                      torch.nn.functional.binary_cross_entropy_with_logits(logits, torch.sigmoid(t_logits)))
+                loss = loss + args.kd_weight * kd
             if args.caption_loss and not lp:
                 yb, db = y.cpu().numpy(), d.cpu().numpy()
                 ids = torch.tensor([cap_keys[(int(k), np.packbits(v > 0.5).tobytes())] for v, k in zip(yb, db)],

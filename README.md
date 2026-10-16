@@ -1,100 +1,96 @@
 # UPAR 2027 Track 1: pedestrian attribute recognition under domain shift
 
-Code for our entry to the [UPAR Challenge 2027, Track 1](https://www.codabench.org/competitions/18180/) (WACV 2027 RWS
-workshop). The task is to predict 40 binary attributes for each pedestrian crop. The model trains on Market1501, PA100k
-and PETA and is tested on two unseen domains, **MEVID** (surveillance video) and a **synthetic** set. Score:
-`Challenge_Avg` = harmonic mean of mA and instance F1, averaged over the two test sets. The submission is code that
-runs on a **CPU-only** scorer within **3600 s** for about 29k images.
+Entry for the [UPAR Challenge 2027, Track 1](https://www.codabench.org/competitions/18180/). The model predicts 40
+binary attributes per pedestrian crop. It trains on Market1501, PA100k and PETA and is tested on unseen domains
+(MEVID, synthetic). The submission is code that runs on an A10 GPU within 300 s.
 
-## How we approached it
+## Architecture
 
-1. **Measure what the leaderboard measures.** The test domains are hidden, so every idea is scored with
-   leave-one-domain-out (LODO): train on two source datasets, test on the third, three folds. Scoring runs the exact
-   submission path (one model, contextual calibration, Codabench metric). In-domain validation over-estimates by
-   about 0.08 and ranks ideas wrongly. The Market1501 fold (re-ID crops, many cameras) tracks MEVID best.
-2. **Fit the CPU budget first.** On the scorer, one ViT-B/16 at 256x128 takes 1900-3200 s, so the submission is
-   always one ViT-B: no ensemble, no TTA, no bigger input, fp32. Everything else (teachers, extra losses) is
-   training-only.
-3. **Pick the backbone by LODO.** Fine-tuning web-scale image-text models generalises best. MetaCLIP B/16 beat
-   OpenAI CLIP, DFN-2B, SigLIP 2 (FixRes and NaFlex), CLIP ViT-L/14 and PE-Core B/16.
-4. **Find the right amount of fine-tuning.** We scored the held-out fold after every epoch and found that it peaks
-   after about 2 epochs (~180k images) and then falls, while in-domain validation keeps rising. Longer training fits
-   the source datasets' labelling conventions (for example, faded jeans called blue in one dataset and grey in
-   another), and this did not change with LoRA or noisy-label losses. We fix the length (`--ft-samples`) instead of
-   choosing an epoch on validation. This gave the largest single gain on the leaderboard.
-5. **Diagnose before adding things.** Error decomposition on held-out folds (`src/error_anatomy.py`)
-   showed that we lose to the top team on instance precision, not on mA. Most errors come from colour naming
-   conflicts between datasets and from small accessories. More than 60 ideas were tested on LODO (heads, losses,
-   layer schedules, LoRA, augmentation, crowd layers, feature distillation). Most traded mA for F1 one-for-one, so
-   the harmonic mean did not move. Logit distillation from an ensemble of two different backbones (MetaCLIP + PE-Core)
-   raised precision without losing mA.
-
-Final recipe: MetaCLIP ViT-B/16, input 256x128 with aspect-preserving padding, full fine-tune with layer-wise lr
-decay 0.8, EMA 0.999, BCE with pos_weight (neg/pos)^0.5 and label smoothing 0.1, domain-balanced sampling,
-unannotated (domain, attribute) pairs masked, 2 epochs, weight soup of 3 seeds, contextual calibration (λ 0.1) at
-inference.
-
-## Quick start
-
-```bash
-# 1. environment + data: RUN_RESEARCH.md sections 1-2, then point the scripts at the data
-ln -s data/annotations/task1 ann && ln -s data/phase1 images
-python src/download_weights.py                       # MetaCLIP, OpenAI CLIP, PE-Core
-
-# 2. score a recipe on the 3 LODO folds (one GPU, ~45 min)
-bash src/job.sh MYRUN --weights weights_own/metaclip_b16 --unfreeze 12 --llrd 0.8 --ft-samples 180000
-
-# 3. build a submission zip (3 seeds + soup + packaging + Docker CPU check) -> builds/ensemble_final.zip
-WEIGHTS=weights_own/metaclip_b16 NAME=final \
-  V8_ARGS="--unfreeze 12 --llrd 0.8 --ft-samples 180000 --exact-samples --train-on-val" bash src/v8_pipeline.sh
+```
+image ──► T2   MetaCLIP ViT-B/16, 256×128 ──► 40 logits ─┐
+      ──► PE-B PE-Core B/16,     256×128 ──► 40 logits ─┼─► calibrate ─► sigmoid ─► per-attribute weighted mean ─► + bias ─► > 0.5
+      ──► PE-L PE-Core L/14,     280×140 ──► 40 logits ─┘
 ```
 
-### Where things are
+| Member | Weight on colour attributes (24) | Weight on other attributes (16) |
+|---|---:|---:|
+| T2 (MetaCLIP B/16, soup of 3 seeds, train+val) | 0.5 | 0.5 |
+| PE-B (PE-Core B/16, train) | 0.5 | 0 |
+| PE-L (PE-Core L/14, train) | 0 | 0.5 |
+
+- **Each member:**
+  - an image encoder initialised from generic image–text pretraining;
+  - the pooled embedding goes through LayerNorm + Linear(40).
+- **Training:**
+  - 1 linear-probe epoch, then full fine-tuning with layer-wise lr decay;
+  - AdamW, EMA 0.999;
+  - BCE with pos_weight ((N−P)/P)^0.5, label smoothing 0.1, unannotated (domain, attribute) pairs masked;
+  - domain-balanced sampling;
+  - augmentation: crop, flip, low-res, blur, brightness/contrast, random erasing.
+- **Calibration:** each member's logits are shifted by 0.1 × (mean logit on 4 fixed content-free images − prior
+  logit).
+- **Bias:** a fixed +0.005 probability is added to Age-Adult and LowerBody-Length-Short.
+- **Selection:** leave-one-domain-out (LODO). Train on two source datasets, score the third, for three folds. Keep a
+  change only if Challenge_Avg rises and instance recall and colour mA do not fall on every fold (`src/lodo_gate.py`).
+  Test data and leaderboard results are never used for selection.
+
+## Code
 
 ```
 src/
-├── download_weights.py     # MetaCLIP B/16, OpenAI CLIP B/16, PE-Core B/16 (~1.3 GB) -> weights/, weights_own/
-├── train.py                # one training run; every option, including those that did not help (--help)
-├── prepare.py              # fixed held-out scorer: single model, contextual calibration, Codabench metric
-├── job.sh                  # one recipe on the 3 LODO folds -> logs/<RUN>.<fold>.log, runs/lodo/<RUN>/<fold>/probe.npz
-├── v8_pipeline.sh          # 3 seeds on all data + weight soup + packaging + Docker CPU check -> builds/ensemble_<NAME>.zip
-├── package_submission.py   # builds the Codabench zip
-├── clip_vit.py             # dependency-free CLIP / SigLIP vision tower, shared by training and the submission
-├── robust2.py, metric_split.py, error_anatomy.py, layer_drift.py   # analysis of held-out probes
-└── ...                     # earlier 2027 baselines and legacy C2T-Net code
-submission/task1/
-├── run.py                  # submission runtime: batching, time budget, calibration
-├── metadata.yaml
-└── assets/attribute_prior.json
+├── train.py              # training (--arch b16 | l14 | siglip | pe | pel), held-out scoring -> probe.npz
+├── prepare.py            # fixed held-out scorer (calibration + Codabench metric)
+├── job.sh                # one recipe on the 3 LODO folds
+├── lodo_gate.py          # compare two ensemble layouts on the LODO probes
+├── export_pe.py          # PE checkpoint -> TorchScript + calibration offsets
+├── v8_pipeline.sh        # T2: 3 seeds + weight soup + single-member package
+├── package_submission.py # single-member package
+├── build_ensemble.py     # T2 package + PE members -> submission zip
+├── clip_vit.py           # CLIP vision tower shared by training and the submission
+└── download_weights.py   # pretrained backbones
+submission/task1/         # run.py (inference, time budget), metadata.yaml, assets/
 ```
 
-Scripts call `python`; set `PY=/path/to/python` for another interpreter. Upload `builds/ensemble_<NAME>.zip` to
-Codabench as is (torch, numpy and Pillow only).
-
-Comparing runs on the held-out probes (`robust2` drops attributes with < 20 source or < 50 held-out positives):
+## Setup
 
 ```bash
-PYTHONPATH=src python src/robust2.py                         # edit `tags` inside: robust and robust2 per fold
-PYTHONPATH=src python src/metric_split.py RUN_A RUN_B         # mA vs instance F1 / precision / recall
-PYTHONPATH=src python src/error_anatomy.py RUN Market1501     # per-attribute FP/FN and colour confusions
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements-research.txt
+git clone https://github.com/speckean/UPAR-Challenge-2027.git ../upar2027_official
+(cd ../upar2027_official && python download_datasets.py --data-dir "$OLDPWD/data/phase1")
+ln -s ../upar2027_official/data/annotations/task1 ann && ln -s data/phase1 images
+python src/download_weights.py metaclip pe pel
 ```
 
-Tried on LODO without a gain: SigLIP 2 (FixRes, NaFlex), DFN, ViT-L, PE-Core alone, LoRA, reverse layer-wise lr,
-frozen top blocks, focal loss, lower pos_weight, crowd layer, colour-group CE, ELR, Lipsum-FT, two-view consistency,
-MixStyle, intermediate CLS fusion, attribute and query heads, same-person consistency, token-level feature
-distillation, longer training (with or without val data).
+## Build the submission
 
-## Legacy: C²T-Net (UPAR 2024)
+```bash
+export PYTHONPATH=src
+COMMON="--train-csv ann/train/gt.csv --val-csv ann/val/gt.csv --image-root images --batch-size 64 --workers 2"
 
-This repository started from C²T-Net (Swin + EVA ViT, a UPAR 2024 Track 1 entry). Its training and inference
-(`run.sh`, `src/infer_upar*.py`) are kept for reference.
+WEIGHTS=weights_own/metaclip_b16 NAME=t2 CC=0.1 \
+  V8_ARGS="--unfreeze 12 --llrd 0.8 --ft-samples 180000 --exact-samples --train-on-val" bash src/v8_pipeline.sh
+python src/train.py --arch pe  --weights weights_own/pe_core_b16 --unfreeze 12 --llrd 0.8 --ft-samples 180000 \
+  --seed 606 $COMMON --output-dir runs/full_pe606
+python src/train.py --arch pel --weights weights_own/pe_core_l14 --size 280 140 --unfreeze 24 --llrd 0.85 \
+  --ft-samples 360000 --seed 606 $COMMON --output-dir runs/full_pel280
 
+UPAR_EXPORT_RUN=runs/full_pe606  UPAR_EXPORT_OUT=exports/pe606  UPAR_EXPORT_FILE=pe606.pt  python src/export_pe.py
+UPAR_EXPORT_RUN=runs/full_pel280 UPAR_EXPORT_OUT=exports/pel280 UPAR_EXPORT_FILE=pel280.pt python src/export_pe.py
+
+python src/build_ensemble.py --base builds/ensemble_t2 --out builds/ensemble_v24 \
+  --pe exports/pel280/pel280.pt:other --pe exports/pe606/pe606.pt:colour \
+  --bias Age-Adult=0.005 --bias LowerBody-Length-Short=0.005
 ```
-@InProceedings{Bui_2024_WACV,
-    author    = {Bui, Doanh C. and Le, Thinh V. and Ngo, Ba Hung},
-    title     = {C2T-Net: Channel-Aware Cross-Fused Transformer-Style Networks for Pedestrian Attribute Recognition},
-    booktitle = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV) Workshops},
-    year      = {2024},
-    pages     = {351-358}
-}
+
+Upload `builds/ensemble_v24.zip` as is. Hardware: one 24 GB GPU (PE-L 280×140 needs ~22 GB at batch 64).
+
+## Evaluate a change
+
+```bash
+bash src/job.sh MYRUN --arch pel --weights weights_own/pe_core_l14 --size 280 140 --unfreeze 24 --llrd 0.85 \
+  --ft-samples 360000 --seed 606 --batch-size 64 --workers 2
+python src/lodo_gate.py --expert t2=runs/lodo/T2 --expert pe606=runs/lodo/PE606 --expert new=runs/lodo/MYRUN \
+  --baseline "colour=t2+pe606 other=t2+pe606" --candidate "colour=t2+pe606 other=t2+new"
 ```

@@ -43,3 +43,15 @@ ONBOARDING.md
 /autoresearch/
 /logs/
 /docs/METHOD_2027.md
+# everything is documented in README.md only; other notes stay local
+/docs/
+*.pdf
+/RUN_RESEARCH.md
+/REPRODUCE_LOCAL.md
+/FEATURE_CACHE.md
+/experiments/README.md
+/exports/
+/tests/test_mgd_loss.py
+/experiments/
+/src/dataset/pedes_attr/annotation.md
+/local/

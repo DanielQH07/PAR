@@ -1,21 +1,17 @@
-"""UPAR 2027 Track 1 submission: ensemble of CLIP ViT-B/16 attribute models.
+"""UPAR 2027 Track 1 submission: per-attribute weighted ensemble (MetaCLIP B/16 + PE-Core B/16 + PE-Core L/14).
 
-The ingestion program imports this file, calls load_model() once and then
-predict_batch(samples). Only torch, numpy and Pillow are needed; the CLIP vision
-tower lives in clip_vit.py. All members share the frozen pre-trained CLIP weights
-(shared.pth); each member stores only its fine-tuned tail and head (member_*.pth).
-Each member's logits (optionally averaged with the h-flipped image) are shifted by a
-precomputed contextual-calibration offset; member probabilities are averaged.
+The ingestion program imports this file, calls load_model() once and then predict_batch(samples). Only torch, numpy
+and Pillow are needed. members.json lists the members in priority order: the MetaCLIP member is the shared CLIP
+tower (shared.pth, clip_vit.py) plus its fine-tuned tail (member_0.pth); PE members are TorchScript files. Each
+member's logits are shifted by a precomputed contextual-calibration offset; member probabilities are averaged with
+per-attribute weights ("attribute_weight"), then an optional fixed "probability_bias" is added.
 
-Robustness (a Codabench worker turned out to be CPU-only, 6 cores; a previous run was
-killed without a traceback after ~13 min, most likely out of memory):
-  * CPU: only the first member is built (at its "cpu_size"), no TTA, 2 decode threads,
-    periodic gc + malloc_trim, resident memory logged; GPU: the full ensemble;
-  * on CPU the ViT linear layers are dynamically quantised to int8;
-  * members are in priority order; on the first batch the per-image cost is measured
-    and flip-TTA, then trailing members, are dropped to fit TIME_BUDGET_S;
-  * hard deadline: once HARD_DEADLINE_S have passed since load_model(), remaining
-    images get the training label prior, so predictions.csv is always produced;
+Robustness (A10 GPU, 300 s per run):
+  * on the first batch the per-image cost is measured and flip-TTA, then trailing members, are dropped to fit
+    TIME_BUDGET_S (270 s);
+  * hard deadline: once HARD_DEADLINE_S (295 s) have passed since load_model(), remaining images get the training
+    label prior, so predictions.csv is always produced;
+  * on a CPU-only worker only the first member is built (fallback);
   * diagnostics go to stderr so they appear in the ingestion log.
 """
 from __future__ import annotations
@@ -40,8 +36,8 @@ sys.path.insert(0, str(HERE))
 from clip_vit import CLIP_MEAN, CLIP_STD, PARModel  # noqa: E402
 
 BATCH_SIZE = 64
-TIME_BUDGET_S = float(os.environ.get("UPAR_TIME_BUDGET_S", 2400))  # platform limit is 3600 s total
-HARD_DEADLINE_S = float(os.environ.get("UPAR_HARD_DEADLINE_S", 3500))  # v9 took 3076 s on the scorer; ~100 s left for container start + writing before the 3600 s platform limit
+TIME_BUDGET_S = float(os.environ.get("UPAR_TIME_BUDGET_S", 270))
+HARD_DEADLINE_S = float(os.environ.get("UPAR_HARD_DEADLINE_S", 295))
 DEFAULT_NUM_IMAGES = 29248
 _STATE: dict[str, Any] = {}
 
@@ -100,19 +96,23 @@ def load_model() -> None:
     members = []
     for member in specs:
         size = tuple(member["size"] if device.type == "cuda" else member.get("cpu_size", member["size"]))
-        model = PARModel(size, member["head"])
-        model.vision.load_hf_state(shared)
-        tail = torch.load(HERE / member["file"], map_location="cpu", weights_only=True)
-        missing, unexpected = model.load_state_dict({k: v.float() for k, v in tail.items()}, strict=False)
-        head_missing = [k for k in missing if k.startswith("head.")]
-        if unexpected or head_missing:
-            raise RuntimeError(f"{member['file']}: unexpected {unexpected}, missing {head_missing}")
-        model = model.eval()
+        if member.get("format") == "torchscript":
+            model = torch.jit.load(HERE / member["file"], map_location=device).eval()
+        else:
+            model = PARModel(size, member["head"])
+            model.vision.load_hf_state(shared)
+            tail = torch.load(HERE / member["file"], map_location="cpu", weights_only=True)
+            missing, unexpected = model.load_state_dict({k: v.float() for k, v in tail.items()}, strict=False)
+            head_missing = [k for k in missing if k.startswith("head.")]
+            if unexpected or head_missing:
+                raise RuntimeError(f"{member['file']}: unexpected {unexpected}, missing {head_missing}")
+            model = model.eval()
         if device.type == "cpu" and os.environ.get("UPAR_QUANT"):  # opt-in: slower on some CPUs
             model.vision = _quantise(model.vision, size)
         key = "correction" if device.type == "cuda" else ("cpu_correction" if "cpu_correction" in member else "correction")
         correction = torch.tensor(member.get(key, [0.0] * 40), dtype=torch.float32)
-        members.append((model.to(device), size, correction.to(device)))
+        weight = torch.tensor(member.get('attribute_weight', [1.0] * 40), dtype=torch.float32, device=device)
+        members.append((model.to(device), size, correction.to(device), weight))
     del shared
     gc.collect()
     # bf16 on Ampere+; fp16 on older GPUs (T4/V100) where bf16 is not supported
@@ -120,8 +120,11 @@ def load_model() -> None:
                  else torch.float16)
     names = config["attribute_names"]
     prior = np.asarray(config.get("prior", [0.5] * 40), dtype=np.float64)
+    probability_bias = np.asarray(config.get("probability_bias", [0.0] * 40), dtype=np.float64)
+    if probability_bias.shape != (40,) or not np.isfinite(probability_bias).all():
+        raise ValueError("probability_bias must contain 40 finite values")
     _STATE.update(members=members, device=device, amp_dtype=amp_dtype, amp=device.type == "cuda",
-                  prior=prior, started=started, deadline_hit=False,
+                  prior=prior, probability_bias=probability_bias, started=started, deadline_hit=False,
                   tta=bool(config.get("tta")) and device.type == "cuda", names=names, batches_done=0, index={n: i for i, n in enumerate(names)},
                   pool=None, pool_pid=None, budget_checked=False)
     _log(f"loaded {len(members)}/{len(config['members'])} members {[m[1] for m in members]}, "
@@ -216,17 +219,20 @@ def _member_logits(model, batch, correction, tta):
 def _fit_budget(samples, batches, prep_per_image) -> None:
     """Time each member on the first batch and drop work that would exceed the budget."""
     device = _STATE["device"]
-    for model, size, correction in _STATE["members"]:  # warm-up (CUDA init, cudnn autotune)
-        _member_logits(model, batches[size][:2], correction, tta=False)
-    costs = []
-    for model, size, correction in _STATE["members"]:
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.monotonic()
+    for model, size, correction, _weight in _STATE["members"]:  # warm-up the measured batch shape too
         _member_logits(model, batches[size], correction, tta=False)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        costs.append((time.monotonic() - t0) / len(samples))
+    costs = []
+    for model, size, correction, _weight in _STATE["members"]:
+        trials = []
+        for _ in range(3):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.monotonic()
+            _member_logits(model, batches[size], correction, tta=False)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            trials.append((time.monotonic() - t0) / len(samples))
+        costs.append(min(trials))
     total = _num_images(samples)
     tta, keep = _STATE["tta"], len(costs)
     # image decoding/resizing is paid once per image regardless of the member count
@@ -256,7 +262,7 @@ def predict_batch(samples: list[dict[str, Any]]) -> list[list[float]]:
             _STATE["deadline_hit"] = True
         return _as_rows(np.tile(_STATE["prior"], (len(samples), 1)), samples)
     device = _STATE["device"]
-    sizes = sorted({size for _, size, _ in _STATE["members"]})
+    sizes = sorted({size for _, size, _, _ in _STATE["members"]})
     prep_started = time.monotonic()
     paths = [_resolve(s) for s in samples]
     canvases = list(_pool().map(lambda p: _canvases(p, sizes), paths))
@@ -270,9 +276,12 @@ def predict_batch(samples: list[dict[str, Any]]) -> list[list[float]]:
         _fit_budget(samples, batches, (time.monotonic() - prep_started) / len(samples))
     members = _STATE["members"]
     probs = torch.zeros((), device=device)
-    for model, size, correction in members:
-        probs = probs + _member_logits(model, batches[size], correction, _STATE["tta"]).sigmoid()
-    probs = (probs / len(members)).clamp(0.0, 1.0).cpu().numpy().astype(np.float64)
+    weight_sum = torch.zeros(40, device=device)
+    for model, size, correction, weight in members:
+        probs = probs + _member_logits(model, batches[size], correction, _STATE["tta"]).sigmoid() * weight
+        weight_sum = weight_sum + weight
+    probs = (probs / weight_sum.clamp_min(1e-12)).clamp(0.0, 1.0).cpu().numpy().astype(np.float64)
+    probs = np.clip(probs + _STATE["probability_bias"], 0.0, 1.0)
     del batches, canvases
     _STATE["batches_done"] += 1
     if _STATE["batches_done"] % 20 == 0:
