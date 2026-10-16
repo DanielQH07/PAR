@@ -1,18 +1,19 @@
 """Build the per-attribute weighted submission (the v23/v24 layout): one MetaCLIP member on all 40 attributes plus
 TorchScript PE members, each assigned to the colour attributes or to the other attributes.
 
---base is a single-member build from package_submission.py (members.json, shared.pth, member_0.pth, clip_vit.py,
-metadata.yaml). Each --pe is FILE:GROUP with GROUP in {colour, other}; FILE needs export_report.json next to it
+--base is a single-member build from package_submission.py, as a directory or .zip (members.json, shared.pth,
+member_0.pth, clip_vit.py, metadata.yaml). Each --pe is FILE:GROUP with GROUP in {colour, other}; FILE needs export_report.json next to it
 (written by export_pe.py). Weights: MetaCLIP 0.5 everywhere, the PE member of a group 0.5 on that group.
 
 Usage (repository root):
-  PYTHONPATH=src python src/build_ensemble.py --base builds/ensemble_t2 --out builds/ensemble_v24 \
+  PYTHONPATH=src python src/build_ensemble.py --base builds/ensemble_t2.zip --out builds/ensemble_v24 \
     --pe exports/pe606/pe606.pt:colour --pe exports/pel280/pel280.pt:other \
     --bias Age-Adult=0.005 --bias LowerBody-Length-Short=0.005
 """
 import argparse
 import json
 import shutil
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,10 @@ def main():
     p.add_argument('--bias', action='append', default=[], help='ATTRIBUTE=VALUE added to the final probability')
     p.add_argument('--tta', action='store_true', help='h-flip TTA (off in v23/v24)')
     args = p.parse_args()
+    if args.base.suffix == '.zip':  # v8_pipeline.sh keeps only the zip
+        tmp = Path(tempfile.mkdtemp())
+        shutil.unpack_archive(args.base, tmp)
+        args.base = tmp
 
     config = json.loads((args.base / 'members.json').read_text())
     assert len(config['members']) == 1, 'base must be a single MetaCLIP member build'

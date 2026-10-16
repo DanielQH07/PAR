@@ -43,7 +43,7 @@ src/
 ├── job.sh                # one recipe on the 3 LODO folds
 ├── lodo_gate.py          # compare two ensemble layouts on the LODO probes
 ├── export_pe.py          # PE checkpoint -> TorchScript + calibration offsets
-├── v8_pipeline.sh        # T2: 3 seeds + weight soup + single-member package
+├── v8_pipeline.sh        # T2: 3 seeds + weight soup + single-member package (+ smoke checks)
 ├── package_submission.py # single-member package
 ├── build_ensemble.py     # T2 package + PE members -> submission zip
 ├── clip_vit.py           # CLIP vision tower shared by training and the submission
@@ -79,7 +79,7 @@ python src/train.py --arch pel --weights weights_own/pe_core_l14 --size 280 140 
 UPAR_EXPORT_RUN=runs/full_pe606  UPAR_EXPORT_OUT=exports/pe606  UPAR_EXPORT_FILE=pe606.pt  python src/export_pe.py
 UPAR_EXPORT_RUN=runs/full_pel280 UPAR_EXPORT_OUT=exports/pel280 UPAR_EXPORT_FILE=pel280.pt python src/export_pe.py
 
-python src/build_ensemble.py --base builds/ensemble_t2 --out builds/ensemble_v24 \
+python src/build_ensemble.py --base builds/ensemble_t2.zip --out builds/ensemble_v24 \
   --pe exports/pel280/pel280.pt:other --pe exports/pe606/pe606.pt:colour \
   --bias Age-Adult=0.005 --bias LowerBody-Length-Short=0.005
 ```
