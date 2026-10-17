@@ -4,6 +4,7 @@ Codabench submission so both run the exact same forward pass."""
 import math
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 from torch.nn import functional as F
 
@@ -31,21 +32,25 @@ class EncoderLayer(nn.Module):
                    for proj in (self.q_proj, self.k_proj, self.v_proj))
         x = x + self.out_proj(F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, t, w))
         h = self.fc1(self.layer_norm2(x))
-        h = h * torch.sigmoid(1.702 * h) if self.act == 'quick_gelu' else F.gelu(h, approximate='tanh')
+        h = (h * torch.sigmoid(1.702 * h) if self.act == 'quick_gelu' else F.gelu(h) if self.act == 'gelu'
+             else F.gelu(h, approximate='tanh'))
         return x + self.fc2(h)
 
 
 class CLIPVision(nn.Module):
     """Returns (pooled CLS after post_layernorm, projected 512-d embedding)."""
 
-    def __init__(self, size=(224, 224), width=768, layers=12, patch=16, embed=512):
+    grad_ckpt = False  # train.py --grad-ckpt: recompute layer activations in backward (same maths, less memory)
+
+    def __init__(self, size=(224, 224), width=768, layers=12, patch=16, embed=512, act='quick_gelu', heads=None):
         super().__init__()
         self.grid = (size[0] // patch, size[1] // patch)
         self.class_embedding = nn.Parameter(torch.zeros(width))
         self.patch_embedding = nn.Conv2d(3, width, patch, patch, bias=False)
         self.position_embedding = nn.Parameter(torch.zeros(1 + self.grid[0] * self.grid[1], width))
         self.pre_layrnorm = nn.LayerNorm(width, eps=1e-5)
-        self.layers = nn.ModuleList(EncoderLayer(width, width // 64) for _ in range(layers))  # 12 heads (B), 16 (L)
+        self.layers = nn.ModuleList(EncoderLayer(width, heads or width // 64, act=act)  # 12 heads (B), 16 (L, H)
+                                    for _ in range(layers))
         self.post_layernorm = nn.LayerNorm(width, eps=1e-5)
         self.visual_projection = nn.Linear(width, embed, bias=False)
 
@@ -76,7 +81,10 @@ class CLIPVision(nn.Module):
         x = torch.cat((cls, x), dim=1) + self.position_embedding.to(x.dtype)
         x = self.pre_layrnorm(x)
         for layer in self.layers[:stop]:
-            x = layer(x)
+            if self.grad_ckpt and self.training and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         return x
 
     def pool(self, x):

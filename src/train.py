@@ -34,6 +34,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.utils.checkpoint
 from PIL import Image, ImageFilter
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
@@ -288,16 +289,19 @@ class TimmPEVision(torch.nn.Module):
     """P1-pe: Perception Encoder PE-Core B/16 (timm EVA with 2D RoPE, MAP pooling) with the CLIPVision interface;
     training only (a submission would ship it as TorchScript). Inputs stay CLIP-normalised, re-normalised to 0.5/0.5."""
 
-    def __init__(self, size, name='vit_pe_core_base_patch16_224'):
+    def __init__(self, size, name='vit_pe_core_base_patch16_224', norm=((0.5,) * 3, (0.5,) * 3), **kw):
         super().__init__()
         import timm
-        self.m = timm.create_model(name, pretrained=False, img_size=tuple(size), num_classes=1024)
+        kw = kw or {'num_classes': 1024}
+        self.m = timm.create_model(name, pretrained=False, img_size=tuple(size), **kw)
         self.layers, self.post_layernorm = self.m.blocks, self.m.norm
         self.visual_projection = torch.nn.Identity()
-        self.head = torch.nn.ModuleList([self.m.attn_pool, self.m.fc_norm])
-        std, mean = torch.tensor(CLIP_STD).view(1, 3, 1, 1), torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
-        self.register_buffer('in_scale', std / 0.5, persistent=False)
-        self.register_buffer('in_shift', (mean - 0.5) / 0.5, persistent=False)
+        self.head = torch.nn.ModuleList([h for h in (self.m.attn_pool, self.m.fc_norm) if h is not None])
+        # CLIP-normalised input -> the model's own normalisation (PE: 0.5/0.5; DINOv3: ImageNet)
+        clip_std, clip_mean = torch.tensor(CLIP_STD).view(1, 3, 1, 1), torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
+        mean, std = (torch.tensor(v).view(1, 3, 1, 1) for v in norm)
+        self.register_buffer('in_scale', clip_std / std, persistent=False)
+        self.register_buffer('in_shift', (clip_mean - mean) / std, persistent=False)
         self._rope = None
 
     def load_hf_state(self, state):
@@ -305,12 +309,17 @@ class TimmPEVision(torch.nn.Module):
         missing = self.m.load_state_dict(checkpoint_filter_fn(state, self.m), strict=False).missing_keys
         assert not missing, missing
 
+    grad_ckpt = False  # --grad-ckpt: recompute block activations in backward (same maths, less memory)
+
     def tokens(self, pixels, stop=None):
         x = self.m.patch_embed(pixels * self.in_scale.to(pixels.dtype) + self.in_shift.to(pixels.dtype))
         x, self._rope = self.m._pos_embed(x)
         x = self.m.norm_pre(x)
         for blk in self.layers[:stop]:
-            x = blk(x, rope=self._rope)
+            if self.grad_ckpt and self.training and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(blk, x, rope=self._rope, use_reentrant=False)
+            else:
+                x = blk(x, rope=self._rope)
         return x
 
     def pool(self, x):
@@ -320,6 +329,55 @@ class TimmPEVision(torch.nn.Module):
     def tail(self, x, start):
         for blk in self.layers[start:]:
             x = blk(x, rope=self._rope)
+        return self.pool(x)
+
+
+class HRNetVision(torch.nn.Module):
+    """BPBReID backbone: timm HRNet-W32 stem + 4 stages + incre modules; the 4 branches are upsampled to the
+    1/4-resolution grid and concatenated (128+256+512+1024 = 1920 channels, as in BPBReID), then average-pooled.
+    'layers' are the 5 stage groups (for --unfreeze / --llrd). Inputs stay CLIP-normalised, re-normalised to ImageNet."""
+    width = 1920
+
+    def __init__(self):
+        super().__init__()
+        import timm
+        m = timm.create_model('hrnet_w32', pretrained=False, num_classes=0)
+        self.m = m
+        self.layers = torch.nn.ModuleList([
+            torch.nn.ModuleList([m.conv1, m.bn1, m.conv2, m.bn2]), m.layer1,
+            torch.nn.ModuleList([m.transition1, m.stage2]), torch.nn.ModuleList([m.transition2, m.stage3]),
+            torch.nn.ModuleList([m.transition3, m.stage4, m.incre_modules])])
+        self.post_layernorm = torch.nn.Identity()
+        self.visual_projection = torch.nn.Identity()
+        clip_std, clip_mean = torch.tensor(CLIP_STD).view(1, 3, 1, 1), torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
+        mean, std = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1), torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+        self.register_buffer('in_scale', clip_std / std, persistent=False)
+        self.register_buffer('in_shift', (clip_mean - mean) / std, persistent=False)
+
+    def load_hf_state(self, state):
+        """BPBReID checkpoint (module.backbone_appearance_feature_extractor.*) or our own (m.*)."""
+        pre = 'module.backbone_appearance_feature_extractor.'
+        state = {k[len(pre):] if k.startswith(pre) else k.removeprefix('m.'): v for k, v in state.items()}
+        own = {k for k in self.m.state_dict() if not k.startswith(('downsamp_modules.', 'final_layer.', 'classifier.'))}
+        missing = sorted(own - set(state))
+        assert not missing, missing
+        self.m.load_state_dict({k: state[k] for k in own}, strict=False)
+
+    def tokens(self, pixels, stop=None):
+        m = self.m
+        x = pixels * self.in_scale.to(pixels.dtype) + self.in_shift.to(pixels.dtype)
+        x = m.act2(m.bn2(m.conv2(m.act1(m.bn1(m.conv1(x))))))
+        y = m.stages(x)
+        y = [inc(t) for inc, t in zip(m.incre_modules, y)]
+        size = y[0].shape[-2:]
+        return torch.cat([y[0]] + [torch.nn.functional.interpolate(t, size=size, mode='bilinear', align_corners=True)
+                                   for t in y[1:]], 1)
+
+    def pool(self, x):
+        pooled = x.mean((2, 3))
+        return pooled, pooled
+
+    def tail(self, x, start):
         return self.pool(x)
 
 
@@ -341,6 +399,25 @@ class PARPlus(PARModel):
             from clip_vit import AttributeHead
             self.vision = TimmPEVision(size, 'vit_pe_core_large_patch14_336')
             self.head = AttributeHead(head, width=1024, embed=1024)
+        elif arch == 'h14':  # MetaCLIP H/14 (32 layers, width 1280, 16 heads, 1024-d projection); use --grad-ckpt
+            from clip_vit import AttributeHead, CLIPVision
+            self.vision = CLIPVision(size, width=1280, layers=32, patch=14, embed=1024, heads=16)
+            self.head = AttributeHead(head, width=1280, embed=1024)
+        elif arch == 'dinov3':  # DINOv3 ViT-B/16 (LVD-1689M, timm; CLS token + 4 registers, RoPE)
+            from clip_vit import AttributeHead
+            self.vision = TimmPEVision(size, 'vit_base_patch16_dinov3', ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+                                       num_classes=0, global_pool='token')
+            self.head = AttributeHead(head, embed=768)
+        elif arch in ('mc2b', 'mc2l'):  # MetaCLIP 2 worldwide B/16 or L/14: CLIP ViT with exact GELU
+            from clip_vit import AttributeHead, CLIPVision
+            large = arch == 'mc2l'
+            self.vision = (CLIPVision(size, width=1024, layers=24, patch=14, embed=768, act='gelu') if large
+                           else CLIPVision(size, act='gelu'))
+            self.head = AttributeHead(head, width=1024 if large else 768, embed=768 if large else 512)
+        elif arch == 'hrnet':  # BPBReID HRNet-W32 (re-ID pretrained CNN)
+            from clip_vit import AttributeHead
+            self.vision = HRNetVision()
+            self.head = AttributeHead(head, width=HRNetVision.width, embed=HRNetVision.width)
         elif arch == 'siglip':  # S1: SigLIP 2 ViT-B/16 (attention-pooling head, no CLS)
             from clip_vit import AttributeHead, SiglipVision
             self.vision = SiglipVision(size)
@@ -636,7 +713,7 @@ def main():
                    help='C1: weight of MSE between logits of two differently augmented views (2x compute)')
     p.add_argument('--mixstyle', type=int, nargs='*', default=(), help='MixStyle after these block indices (1-based), p 0.5')
     p.add_argument('--llrd', type=float, default=1.0, help='layer-wise lr decay per block below the top (1 = off)')
-    p.add_argument('--arch', choices=('b16', 'l14', 'siglip', 'pe', 'pel'), default='b16', help='l14: CLIP ViT-L/14 (teacher experiments)')
+    p.add_argument('--arch', choices=('b16', 'l14', 'siglip', 'pe', 'pel', 'dinov3', 'mc2b', 'mc2l', 'hrnet', 'h14'), default='b16', help='l14: CLIP ViT-L/14 (teacher experiments)')
     p.add_argument('--muon', action='store_true', help='Muon for the unfrozen 2-D backbone weights (AdamW for the rest)')
     p.add_argument('--softcap', type=float, default=0.0, help='logit soft-capping c; 0 = off')
     p.add_argument('--unfreeze', type=int, default=4, help='number of last blocks to train')
@@ -681,6 +758,8 @@ def main():
     p.add_argument('--lipsum-text', type=Path, help='full HF CLIP dir for the random-text features (default: --weights)')
     p.add_argument('--anchor', type=float, default=0.0, help='weight of reference anchoring; 0 = off')
     p.add_argument('--domain-tags', type=float, default=0.0, help='prob of generic tag; 0 = off')
+    p.add_argument('--grad-ckpt', action='store_true', help='ViT archs (CLIP / PE / DINOv3): gradient checkpointing, '
+                   'e.g. PE-L 280x140 at batch 64 on a 16 GB GPU (identical updates, ~30%% slower)')
     p.add_argument('--save-alpha', type=float, help='also save WiSE-FT weights at this alpha as final.pth')
     p.add_argument('--limit', type=int, default=0, help='smoke test: rows per split')
     p.add_argument('--seed', type=int, default=605)
@@ -771,6 +850,9 @@ def main():
     state = torch.load(weights_file, map_location='cpu', weights_only=True)  # HF CLIP or our shared.pth
     state = {k: v.float() for k, v in state.items()}
     model.vision.load_hf_state(state)
+    if args.grad_ckpt:
+        assert hasattr(model.vision, 'grad_ckpt'), 'this arch has no gradient checkpointing'
+        model.vision.grad_ckpt = True
     prior = np.clip(positive / len(labels), 1e-4, 1 - 1e-4)
     with torch.no_grad():
         if args.head == 'text':

@@ -90,8 +90,8 @@ def load_model() -> None:
     _log(f"python {platform.python_version()} torch {torch.__version__} device {device}"
          + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else "")
          + f" cpus {os.cpu_count()} threads {torch.get_num_threads()}")
-    shared = {k: v.float() for k, v in
-              torch.load(HERE / "shared.pth", map_location="cpu", weights_only=True).items()}
+    shared = ({k: v.float() for k, v in torch.load(HERE / "shared.pth", map_location="cpu", weights_only=True).items()}
+              if (HERE / "shared.pth").exists() else {})  # absent when every member is TorchScript
     specs = config["members"] if device.type == "cuda" else config["members"][:1]
     members = []
     for member in specs:

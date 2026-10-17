@@ -1,7 +1,9 @@
 """Export a fine-tuned PE-Core member (arch pe or pel) to TorchScript for the submission and compute its
 contextual-calibration correction. Verifies eager vs traced outputs at batch 1/7/64.
 Usage (repository root): UPAR_EXPORT_RUN=runs/full_pel UPAR_EXPORT_OUT=exports/pel UPAR_EXPORT_FILE=pel.pt \\
-  PYTHONPATH=src python src/export_pe.py   (optional UPAR_EXPORT_SIZE=H,W re-sizes the positional grid)"""
+  PYTHONPATH=src python src/export_pe.py   (optional UPAR_EXPORT_SIZE=H,W re-sizes the positional grid;
+  UPAR_EXPORT_CKPT=final.pth exports the WiSE-FT weights saved by train.py --save-alpha instead of best_ema.pth;
+  any PARPlus arch works, e.g. a SigLIP 2 run)"""
 import csv
 import json
 import os
@@ -26,10 +28,10 @@ def main():
     original_size = tuple(meta["size"])
     size = tuple(map(int, os.environ.get("UPAR_EXPORT_SIZE", ",".join(map(str, original_size))).split(",")))
     arch = meta.get("arch", "pe")
-    patch = 14 if arch == "pel" else 16
+    patch = 14 if arch in ("pel", "mc2l", "l14", "h14") else 16
     if len(size) != 2 or any(n <= 0 or n % patch for n in size):
         raise ValueError(f"invalid export size: {size}")
-    state = torch.load(RUN / "best_ema.pth", map_location="cpu", weights_only=True)
+    state = torch.load(RUN / os.environ.get("UPAR_EXPORT_CKPT", "best_ema.pth"), map_location="cpu", weights_only=True)
     if size != original_size:
         old_grid = (original_size[0] // patch, original_size[1] // patch)
         new_grid = (size[0] // patch, size[1] // patch)

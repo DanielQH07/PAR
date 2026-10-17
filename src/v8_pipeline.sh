@@ -72,4 +72,6 @@ docker run --rm --network none --cpus 6 -m 8g --user 65534:65534 -e HOME=/tmp \
   -v "$PWD/sim/out:/out" -w /tmp pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime \
   python /app/ingest.py --zip /app/sub.zip --input-dir /app/input_data --work-dir /tmp/work --output /out/${NAME}_cpu.csv
 rm -rf builds/ensemble_${NAME} sim/${NAME}in
+# passed every check: copy to the upload folder as {id}_${NAME}.zip (SAVE_SUBMIT=0 skips it)
+[ "${SAVE_SUBMIT:-1}" = 0 ] || PYTHONPATH=src $PY src/save_submission.py builds/ensemble_${NAME}.zip --name $NAME --note "single member (soup3)"
 echo "== $(date) done" && touch runs/${NAME}.done
