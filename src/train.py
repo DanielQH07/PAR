@@ -80,7 +80,7 @@ class Images(Dataset):
         self.std = torch.tensor(CLIP_STD).view(3, 1, 1)
         self.pad = tuple(round(c * 255) for c in CLIP_MEAN)
         self.groups = None
-        self.wb, self.gamma, self.jpeg_prob = 0.0, 0.0, 0.0
+        self.wb, self.gamma, self.jpeg_prob, self.lowres_prob = 0.0, 0.0, 0.0, 0.3
 
     def set_identity_pairs(self):
         """P1-id: Market file names carry the person id; each item also returns another image of the same person."""
@@ -127,7 +127,7 @@ class Images(Dataset):
                 cw, ch = max(1, round(image.width * sw)), max(1, round(image.height * sh))
                 x0, y0 = random.randint(0, image.width - cw), random.randint(0, image.height - ch)
                 image = image.crop((x0, y0, x0 + cw, y0 + ch))
-            if strong and random.random() < 0.3:  # simulate low-resolution cameras
+            if strong and random.random() < self.lowres_prob:  # simulate low-resolution cameras
                 f = random.uniform(0.25, 0.6)
                 small = (max(8, round(image.width * f)), max(8, round(image.height * f)))
                 image = image.resize(small, Image.Resampling.BILINEAR)
@@ -332,6 +332,65 @@ class TimmPEVision(torch.nn.Module):
         return self.pool(x)
 
 
+class TimmViTVision(torch.nn.Module):
+    """Any timm VisionTransformer (TIPSv2, MobileCLIP2-B MCi, TULIP/SigLIP, AIMv2, ...) with the CLIPVision interface:
+    tokens = forward_features (final norm included), pooled = forward_head(pre_logits) (token / avg / MAP as the model
+    defines). Weights go through the model module's checkpoint_filter_fn (pos-embed resampling to --size).
+    Inputs stay CLIP-normalised, re-normalised to the model's own mean/std inside."""
+
+    def __init__(self, size, name, norm, **kw):
+        super().__init__()
+        import timm
+        self.m = timm.create_model(name, pretrained=False, img_size=tuple(size), num_classes=0, **kw)
+        self.layers = self.m.blocks
+        self.post_layernorm = torch.nn.Identity()
+        self.visual_projection = torch.nn.Identity()
+        self.head = torch.nn.ModuleList([getattr(self.m, k) for k in ('norm', 'fc_norm', 'attn_pool')
+                                         if getattr(self.m, k, None) is not None])
+        self.width = self.m.num_features
+        clip_std, clip_mean = torch.tensor(CLIP_STD).view(1, 3, 1, 1), torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
+        mean, std = (torch.tensor(v).view(1, 3, 1, 1) for v in norm)
+        self.register_buffer('in_scale', clip_std / std, persistent=False)
+        self.register_buffer('in_shift', (clip_mean - mean) / std, persistent=False)
+
+    @property
+    def grad_ckpt(self):
+        return self.m.grad_checkpointing
+
+    @grad_ckpt.setter
+    def grad_ckpt(self, on):
+        self.m.set_grad_checkpointing(on)
+
+    def load_hf_state(self, state):
+        import importlib
+        own = set(self.m.state_dict())
+        if not any(k.startswith('m.') for k in state):  # pretrained timm checkpoint (not our own run)
+            filt = getattr(importlib.import_module(type(self.m).__module__), 'checkpoint_filter_fn', None)
+            state = filt(state, self.m) if filt else state
+        state = {k.removeprefix('m.'): v for k, v in state.items()}
+        missing = sorted(k for k in own - set(state) if not k.startswith('head.'))
+        assert not missing, missing
+        self.m.load_state_dict({k: v for k, v in state.items() if k in own}, strict=False)
+
+    def tokens(self, pixels, stop=None):
+        return self.m.forward_features(pixels * self.in_scale.to(pixels.dtype) + self.in_shift.to(pixels.dtype))
+
+    def pool(self, x):
+        pooled = self.m.forward_head(x, pre_logits=True)
+        return pooled, pooled
+
+    def tail(self, x, start):
+        return self.pool(x)
+
+
+TIMM_ARCHS = {  # arch: (timm name, input mean/std)
+    'tipsv2': ('vit_base_patch14_reg1_tipsv2', ((0.0,) * 3, (1.0,) * 3)),
+    'mobileclip2': ('vit_base_mci_224', ((0.0,) * 3, (1.0,) * 3)),
+    'tulip': ('vit_base_patch16_siglip_224', ((0.5,) * 3, (0.5,) * 3)),
+    'aimv2l': ('aimv2_large_patch14_224', ((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))),
+}
+
+
 class HRNetVision(torch.nn.Module):
     """BPBReID backbone: timm HRNet-W32 stem + 4 stages + incre modules; the 4 branches are upsampled to the
     1/4-resolution grid and concatenated (128+256+512+1024 = 1920 channels, as in BPBReID), then average-pooled.
@@ -403,6 +462,10 @@ class PARPlus(PARModel):
             from clip_vit import AttributeHead, CLIPVision
             self.vision = CLIPVision(size, width=1280, layers=32, patch=14, embed=1024, heads=16)
             self.head = AttributeHead(head, width=1280, embed=1024)
+        elif arch in TIMM_ARCHS:
+            from clip_vit import AttributeHead
+            self.vision = TimmViTVision(size, *TIMM_ARCHS[arch])
+            self.head = AttributeHead(head, width=self.vision.width, embed=self.vision.width)
         elif arch == 'dinov3':  # DINOv3 ViT-B/16 (LVD-1689M, timm; CLS token + 4 registers, RoPE)
             from clip_vit import AttributeHead
             self.vision = TimmPEVision(size, 'vit_base_patch16_dinov3', ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
@@ -701,6 +764,8 @@ def main():
                    help='F1: set the number of fine-tuning epochs to round(ft_samples / training images)')
     p.add_argument('--wb-jitter', type=float, default=0.0, help='W1: per-channel gain jitter +-a (camera white balance)')
     p.add_argument('--gamma-jitter', type=float, default=0.0, help='W1: gamma = exp(U(-b, b)) (exposure)')
+    p.add_argument('--lowres-prob', type=float, default=0.3,
+                   help='training-only probability of the low-resolution camera down/up-sampling (strong aug)')
     p.add_argument('--jpeg-prob', type=float, default=0.0,
                    help='training-only JPEG recompression probability (quality 35-75, full chroma)')
     p.add_argument('--exact-samples', action='store_true',
@@ -713,13 +778,14 @@ def main():
                    help='C1: weight of MSE between logits of two differently augmented views (2x compute)')
     p.add_argument('--mixstyle', type=int, nargs='*', default=(), help='MixStyle after these block indices (1-based), p 0.5')
     p.add_argument('--llrd', type=float, default=1.0, help='layer-wise lr decay per block below the top (1 = off)')
-    p.add_argument('--arch', choices=('b16', 'l14', 'siglip', 'pe', 'pel', 'dinov3', 'mc2b', 'mc2l', 'hrnet', 'h14'), default='b16', help='l14: CLIP ViT-L/14 (teacher experiments)')
+    p.add_argument('--arch', choices=('b16', 'l14', 'siglip', 'pe', 'pel', 'dinov3', 'mc2b', 'mc2l', 'hrnet', 'h14', 'tipsv2', 'mobileclip2', 'tulip', 'aimv2l'), default='b16', help='l14: CLIP ViT-L/14 (teacher experiments)')
     p.add_argument('--muon', action='store_true', help='Muon for the unfrozen 2-D backbone weights (AdamW for the rest)')
     p.add_argument('--softcap', type=float, default=0.0, help='logit soft-capping c; 0 = off')
     p.add_argument('--unfreeze', type=int, default=4, help='number of last blocks to train')
     p.add_argument('--epochs', type=int, default=6)
     p.add_argument('--lp-epochs', type=int, default=1)
     p.add_argument('--batch-size', type=int, default=64)
+    p.add_argument('--eval-batch-size', type=int, default=256, help='val/held-out batch (lower for H/14: 256 OOMs on 16 GB)')
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--backbone-lr', type=float, default=2e-5)
     p.add_argument('--head-lr', type=float, default=1e-3)
@@ -818,6 +884,7 @@ def main():
     train_set = Images(train_rows, args.image_root, size, True, args.aug)
     train_set.wb, train_set.gamma = args.wb_jitter, args.gamma_jitter
     train_set.jpeg_prob = args.jpeg_prob
+    train_set.lowres_prob = args.lowres_prob
     if args.elr:  # L2: early-learning regularisation (Liu et al., NeurIPS 2020), binary per attribute
         train_set.with_index = True
         elr_t = torch.zeros(len(train_rows), 40, device=device)
@@ -837,7 +904,7 @@ def main():
                                   batch_size=args.batch_size, sampler=sampler, drop_last=True,
                                   persistent_workers=args.workers > 0, **loader_kw)
     # val loader keeps its workers: spawned once, not every epoch (worker segfaults at spawn hang the run)
-    eval_loader = lambda rows, keep=False: DataLoader(Images(rows, args.image_root, size), batch_size=256,
+    eval_loader = lambda rows, keep=False: DataLoader(Images(rows, args.image_root, size), batch_size=args.eval_batch_size,
                                                       persistent_workers=keep and args.workers > 0, **loader_kw)
     val_loader = eval_loader(val_rows, True) if val_rows and not args.train_on_val else None
     held_loader = eval_loader(held_rows) if held_rows else None
@@ -1134,7 +1201,7 @@ def main():
               'train_images': len(train_rows), 'best_epoch': best_epoch, 'source_val_best': best,
               'pos_weight_max': float(pos_weight.max()), 'annotated': annotated.tolist(),
               'total_seconds': time.monotonic() - started, 'history': history}
-    finetuned = torch.load(args.output_dir / 'best_ema.pth', map_location=device, weights_only=True)
+    finetuned = torch.load(args.output_dir / 'best_ema.pth', map_location='cpu', weights_only=True)  # cpu: H/14 OOMs with a 2nd GPU copy
     if hasattr(ema, 'domain_bias'):
         ema.domain_bias.data.zero_()  # already folded into the head bias by export()
         result['domain_bias'] = ema_bias_snapshot

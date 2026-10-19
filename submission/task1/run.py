@@ -123,7 +123,8 @@ def load_model() -> None:
     probability_bias = np.asarray(config.get("probability_bias", [0.0] * 40), dtype=np.float64)
     if probability_bias.shape != (40,) or not np.isfinite(probability_bias).all():
         raise ValueError("probability_bias must contain 40 finite values")
-    _STATE.update(members=members, device=device, amp_dtype=amp_dtype, amp=device.type == "cuda",
+    member_tta = [bool(m.get("tta")) and device.type == "cuda" for m in specs]  # per-member h-flip TTA
+    _STATE.update(members=members, member_tta=member_tta, device=device, amp_dtype=amp_dtype, amp=device.type == "cuda",
                   prior=prior, probability_bias=probability_bias, started=started, deadline_hit=False,
                   tta=bool(config.get("tta")) and device.type == "cuda", names=names, batches_done=0, index={n: i for i, n in enumerate(names)},
                   pool=None, pool_pid=None, budget_checked=False)
@@ -236,18 +237,23 @@ def _fit_budget(samples, batches, prep_per_image) -> None:
     total = _num_images(samples)
     tta, keep = _STATE["tta"], len(costs)
     # image decoding/resizing is paid once per image regardless of the member count
-    projected = lambda k, flip: total * (prep_per_image + sum(costs[:k]) * (2 if flip else 1))  # noqa: E731
-    while projected(keep, tta) > TIME_BUDGET_S and (tta or keep > 1):
+    member_tta = _STATE["member_tta"]
+    projected = lambda k, flip: total * (prep_per_image + sum(  # noqa: E731
+        c * (2 if flip or member_tta[i] else 1) for i, c in enumerate(costs[:k])))
+    while projected(keep, tta) > TIME_BUDGET_S and (tta or any(member_tta) or keep > 1):
         if tta:
             tta = False
+        elif any(member_tta):
+            member_tta = [False] * len(member_tta)
         else:
             keep -= 1
     _log(f"per-image cost: preprocessing {prep_per_image * 1000:.1f} ms, "
          f"members {[round(c * 1000, 1) for c in costs]} ms; "
-         f"{total} images -> keeping {keep}/{len(costs)} members, tta={tta}, "
+         f"{total} images -> keeping {keep}/{len(costs)} members, tta={tta}, member tta={member_tta[:keep]}, "
          f"projected {projected(keep, tta) / 60:.1f} min (budget {TIME_BUDGET_S / 60:.0f} min)")
     _STATE["members"] = _STATE["members"][:keep]
     _STATE["tta"] = tta
+    _STATE["member_tta"] = member_tta[:keep]
     _STATE["budget_checked"] = True
 
 
@@ -277,8 +283,8 @@ def predict_batch(samples: list[dict[str, Any]]) -> list[list[float]]:
     members = _STATE["members"]
     probs = torch.zeros((), device=device)
     weight_sum = torch.zeros(40, device=device)
-    for model, size, correction, weight in members:
-        probs = probs + _member_logits(model, batches[size], correction, _STATE["tta"]).sigmoid() * weight
+    for (model, size, correction, weight), flip in zip(members, _STATE["member_tta"]):
+        probs = probs + _member_logits(model, batches[size], correction, _STATE["tta"] or flip).sigmoid() * weight
         weight_sum = weight_sum + weight
     probs = (probs / weight_sum.clamp_min(1e-12)).clamp(0.0, 1.0).cpu().numpy().astype(np.float64)
     probs = np.clip(probs + _STATE["probability_bias"], 0.0, 1.0)

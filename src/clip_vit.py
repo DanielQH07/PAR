@@ -69,6 +69,9 @@ class CLIPVision(nn.Module):
         if pos.shape != self.position_embedding.shape:
             mapped['position_embedding'] = resize_position_embedding(pos, self.grid)
         own = self.state_dict()
+        proj = 'visual_projection.weight'  # only the 'text' head uses it: keep the init if absent or another size
+        if proj not in mapped or mapped[proj].shape != own[proj].shape:
+            mapped[proj] = own[proj]
         missing = sorted(set(own) - set(mapped))
         if missing:
             raise RuntimeError(f'Missing CLIP parameters: {missing}')
