@@ -71,6 +71,16 @@ def read_rows(path):
     return rows[0][1:], rows[1:]
 
 
+
+def motion_blur(image, length, angle):
+    """Linear motion blur (walking person in video): mean of `length` copies shifted along `angle`."""
+    a = np.asarray(image, dtype=np.float32)
+    dx, dy = math.cos(angle), math.sin(angle)
+    out = np.zeros_like(a)
+    for t in np.linspace(-(length - 1) / 2, (length - 1) / 2, length):
+        out += np.roll(a, (round(t * dy), round(t * dx)), axis=(0, 1))
+    return Image.fromarray((out / length).clip(0, 255).astype(np.uint8))
+
 class Images(Dataset):
     def __init__(self, rows, root, size, train=False, aug='flip'):
         self.paths = np.array([r[0] for r in rows])  # compact: avoids per-worker list copies
@@ -81,6 +91,7 @@ class Images(Dataset):
         self.pad = tuple(round(c * 255) for c in CLIP_MEAN)
         self.groups = None
         self.wb, self.gamma, self.jpeg_prob, self.lowres_prob = 0.0, 0.0, 0.0, 0.3
+        self.mevid_prob, self.synth_prob, self.crop_min, self.erase_prob = 0.0, 0.0, 0.85, 0.3
 
     def set_identity_pairs(self):
         """P1-id: Market file names carry the person id; each item also returns another image of the same person."""
@@ -122,8 +133,8 @@ class Images(Dataset):
         with Image.open(self.root / path) as image:
             image = image.convert('RGB')
             strong = self.train and self.aug == 'strong'
-            if strong and random.random() < 0.5:  # crop 85-100% of each side
-                sw, sh = (random.uniform(0.85, 1.0) for _ in range(2))
+            if strong and random.random() < 0.5:  # crop crop_min-100% of each side (default 85%)
+                sw, sh = (random.uniform(self.crop_min, 1.0) for _ in range(2))
                 cw, ch = max(1, round(image.width * sw)), max(1, round(image.height * sh))
                 x0, y0 = random.randint(0, image.width - cw), random.randint(0, image.height - ch)
                 image = image.crop((x0, y0, x0 + cw, y0 + ch))
@@ -133,6 +144,18 @@ class Images(Dataset):
                 image = image.resize(small, Image.Resampling.BILINEAR)
             if strong and random.random() < 0.2:
                 image = image.filter(ImageFilter.GaussianBlur(random.uniform(0.3, 1.2)))
+            if strong and random.random() < self.mevid_prob:  # MEVID-like video crop: motion blur -> 64-128 px tall -> JPEG q30-50
+                image = motion_blur(image, random.randint(3, 9), random.uniform(0, math.pi))
+                th = random.randint(64, 128)
+                if image.height > th:
+                    image = image.resize((max(8, round(image.width * th / image.height)), th), Image.Resampling.BILINEAR)
+                buffer = io.BytesIO()
+                image.save(buffer, format='JPEG', quality=random.randint(30, 50))
+                buffer.seek(0)
+                with Image.open(buffer) as compressed:
+                    image = compressed.convert('RGB')
+            if strong and random.random() < self.synth_prob:  # rendered look: flattened texture (median filter)
+                image = image.filter(ImageFilter.MedianFilter(random.choice((3, 5))))
             if strong and random.random() < self.jpeg_prob:
                 buffer = io.BytesIO()
                 image.save(buffer, format='JPEG', quality=random.randint(35, 75), subsampling=0)
@@ -154,8 +177,13 @@ class Images(Dataset):
             x = (x * (1 + self.wb * (2 * torch.rand(3, 1, 1) - 1))).clamp(0, 1)
         if self.train and self.gamma:  # exposure / tone curve
             x = x ** math.exp(self.gamma * (2 * random.random() - 1))
+        if strong and self.synth_prob and random.random() < self.synth_prob:  # lighting ramp + mild colour cast
+            ramp = torch.linspace(random.uniform(0.7, 1.0), random.uniform(1.0, 1.3), x.shape[1]).view(1, -1, 1)
+            if random.random() < 0.5:
+                ramp = ramp.flip(1)
+            x = (x * ramp * (1 + 0.08 * (2 * torch.rand(3, 1, 1) - 1))).clamp(0, 1)
         x = (x - self.mean) / self.std
-        if strong and random.random() < 0.3:  # random erasing
+        if strong and random.random() < self.erase_prob:  # random erasing
             eh, ew = random.randint(h // 8, h // 3), random.randint(w // 8, w // 3)
             y0, x0 = random.randint(0, h - eh), random.randint(0, w - ew)
             x[:, y0:y0 + eh, x0:x0 + ew] = torch.randn(3, eh, ew)
@@ -383,11 +411,60 @@ class TimmViTVision(torch.nn.Module):
         return self.pool(x)
 
 
+class ConvNeXtVision(torch.nn.Module):
+    """DINOv3 ConvNeXt (timm convnext_*.dinov3_lvd1689m). 'layers' = stem + every block (a stage's downsample rides with
+    its first block), so --unfreeze / --llrd work per block. Pooled = timm head (avg pool + LayerNorm).
+    Inputs stay CLIP-normalised, re-normalised to ImageNet."""
+    grad_ckpt = False
+
+    def __init__(self, name='convnext_large'):
+        super().__init__()
+        import timm
+        self.m = m = timm.create_model(name, pretrained=False, num_classes=0)
+        groups = [torch.nn.ModuleList([m.stem])]
+        for stage in m.stages:
+            for i, blk in enumerate(stage.blocks):
+                groups.append(torch.nn.ModuleList([stage.downsample, blk]) if i == 0 else torch.nn.ModuleList([blk]))
+        self.layers = torch.nn.ModuleList(groups)
+        self.post_layernorm = torch.nn.Identity()
+        self.visual_projection = torch.nn.Identity()
+        self.width = m.num_features
+        clip_std, clip_mean = torch.tensor(CLIP_STD).view(1, 3, 1, 1), torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
+        mean, std = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1), torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+        self.register_buffer('in_scale', clip_std / std, persistent=False)
+        self.register_buffer('in_shift', (clip_mean - mean) / std, persistent=False)
+
+    def load_hf_state(self, state):
+        state = {k.removeprefix('m.'): v for k, v in state.items()}
+        own = {k for k in self.m.state_dict() if not k.startswith('head.fc')}
+        missing = sorted(own - set(state))
+        assert not missing, missing
+        self.m.load_state_dict({k: state[k] for k in own}, strict=False)
+
+    def tokens(self, pixels, stop=None):
+        x = pixels * self.in_scale.to(pixels.dtype) + self.in_shift.to(pixels.dtype)
+        for group in self.layers:
+            for mod in group:
+                if self.grad_ckpt and self.training and torch.is_grad_enabled() and not isinstance(mod, torch.nn.Identity):
+                    x = torch.utils.checkpoint.checkpoint(mod, x, use_reentrant=False)
+                else:
+                    x = mod(x)
+        return x
+
+    def pool(self, x):
+        pooled = self.m.forward_head(x, pre_logits=True)
+        return pooled, pooled
+
+    def tail(self, x, start):
+        return self.pool(x)
+
 TIMM_ARCHS = {  # arch: (timm name, input mean/std)
     'tipsv2': ('vit_base_patch14_reg1_tipsv2', ((0.0,) * 3, (1.0,) * 3)),
     'mobileclip2': ('vit_base_mci_224', ((0.0,) * 3, (1.0,) * 3)),
     'tulip': ('vit_base_patch16_siglip_224', ((0.5,) * 3, (0.5,) * 3)),
     'aimv2l': ('aimv2_large_patch14_224', ((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))),
+    'eva02l': ('eva02_large_patch14_224', ((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))),
+    'siglip2l': ('vit_large_patch16_siglip_256', ((0.5,) * 3, (0.5,) * 3)),
 }
 
 
@@ -477,6 +554,10 @@ class PARPlus(PARModel):
             self.vision = (CLIPVision(size, width=1024, layers=24, patch=14, embed=768, act='gelu') if large
                            else CLIPVision(size, act='gelu'))
             self.head = AttributeHead(head, width=1024 if large else 768, embed=768 if large else 512)
+        elif arch == 'dinocnl':  # DINOv3 ConvNeXt-L (lvd1689m)
+            from clip_vit import AttributeHead
+            self.vision = ConvNeXtVision('convnext_large')
+            self.head = AttributeHead(head, width=self.vision.width, embed=self.vision.width)
         elif arch == 'hrnet':  # BPBReID HRNet-W32 (re-ID pretrained CNN)
             from clip_vit import AttributeHead
             self.vision = HRNetVision()
@@ -764,6 +845,11 @@ def main():
                    help='F1: set the number of fine-tuning epochs to round(ft_samples / training images)')
     p.add_argument('--wb-jitter', type=float, default=0.0, help='W1: per-channel gain jitter +-a (camera white balance)')
     p.add_argument('--gamma-jitter', type=float, default=0.0, help='W1: gamma = exp(U(-b, b)) (exposure)')
+    p.add_argument('--mevid-prob', type=float, default=0.0, help='MEVID-like degradation: motion blur + 64-128 px + JPEG q30-50')
+    p.add_argument('--synth-prob', type=float, default=0.0, help='Synth-like look: median-filter flattening, lighting ramp, colour cast')
+    p.add_argument('--crop-min', type=float, default=0.85, help='random crop keeps this..100%% of each side')
+    p.add_argument('--erase-prob', type=float, default=0.3, help='random erasing probability')
+    p.add_argument('--attr-pw', default='', help='per-attribute pos_weight multipliers, e.g. Age-Young=2,Age-Old=1.5')
     p.add_argument('--lowres-prob', type=float, default=0.3,
                    help='training-only probability of the low-resolution camera down/up-sampling (strong aug)')
     p.add_argument('--jpeg-prob', type=float, default=0.0,
@@ -778,7 +864,7 @@ def main():
                    help='C1: weight of MSE between logits of two differently augmented views (2x compute)')
     p.add_argument('--mixstyle', type=int, nargs='*', default=(), help='MixStyle after these block indices (1-based), p 0.5')
     p.add_argument('--llrd', type=float, default=1.0, help='layer-wise lr decay per block below the top (1 = off)')
-    p.add_argument('--arch', choices=('b16', 'l14', 'siglip', 'pe', 'pel', 'dinov3', 'mc2b', 'mc2l', 'hrnet', 'h14', 'tipsv2', 'mobileclip2', 'tulip', 'aimv2l'), default='b16', help='l14: CLIP ViT-L/14 (teacher experiments)')
+    p.add_argument('--arch', choices=('b16', 'l14', 'siglip', 'pe', 'pel', 'dinov3', 'mc2b', 'mc2l', 'hrnet', 'h14', 'tipsv2', 'mobileclip2', 'tulip', 'aimv2l', 'dinocnl', 'eva02l', 'siglip2l'), default='b16', help='l14: CLIP ViT-L/14 (teacher experiments)')
     p.add_argument('--muon', action='store_true', help='Muon for the unfrozen 2-D backbone weights (AdamW for the rest)')
     p.add_argument('--softcap', type=float, default=0.0, help='logit soft-capping c; 0 = off')
     p.add_argument('--unfreeze', type=int, default=4, help='number of last blocks to train')
@@ -803,6 +889,8 @@ def main():
                    help='A1: weight of an auxiliary softmax CE over the upper/lower colour groups (one-colour images)')
     p.add_argument('--focal', type=float, default=0.0, help='G8: focal gamma on the BCE (0 = off)')
     p.add_argument('--pos-power', type=float, default=0.5)
+    p.add_argument('--neg-pstar-cap', type=float, default=0.0,
+                   help='(from ttt v28) cap the optimal p(negative) w*t/(w*t+1-t) of smoothed rare-attribute negatives; 0 = off')
     p.add_argument('--label-smoothing', type=float, default=0.1)
     p.add_argument('--domain-balance', type=float, default=0.5)
     p.add_argument('--mask-missing', action=argparse.BooleanOptionalAction, default=True)
@@ -885,6 +973,8 @@ def main():
     train_set.wb, train_set.gamma = args.wb_jitter, args.gamma_jitter
     train_set.jpeg_prob = args.jpeg_prob
     train_set.lowres_prob = args.lowres_prob
+    train_set.mevid_prob, train_set.synth_prob = args.mevid_prob, args.synth_prob
+    train_set.crop_min, train_set.erase_prob = args.crop_min, args.erase_prob
     if args.elr:  # L2: early-learning regularisation (Liu et al., NeurIPS 2020), binary per attribute
         train_set.with_index = True
         elr_t = torch.zeros(len(train_rows), 40, device=device)
@@ -1018,6 +1108,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
     muon_scheduler = torch.optim.lr_scheduler.LambdaLR(muon, lr_factor) if muon else None
     ema = copy.deepcopy(model).eval().requires_grad_(False)
+    for item in filter(None, args.attr_pw.split(',')):  # targeted rare-attribute boost (not the global --pos-power)
+        name, mult = item.split('=')
+        pos_weight[names.index(name)] *= float(mult)
     pos_weight_t = torch.tensor(pos_weight, dtype=torch.float32, device=device)
     annotated_t = torch.tensor(annotated, device=device)
     teachers = []  # B2/K1: frozen teachers see the same augmented batch (resized to their input size); logits averaged
@@ -1084,6 +1177,12 @@ def main():
             if args.logit_adjust:
                 logits = logits + la_offset[d]
             target = y * (1 - eps / 2) if args.smooth_positives_only else y * (1 - eps) + eps / 2
+            if args.neg_pstar_cap:  # optimum p(negative) = w t / (w t + 1 - t), capped at neg_pstar_cap (ttt v28)
+                c = args.neg_pstar_cap
+                old_t = 0.0 if args.smooth_positives_only else eps / 2
+                pstar = pos_weight_t * old_t / (pos_weight_t * old_t + 1 - old_t)
+                neg_t = torch.where(pstar > c, c / (pos_weight_t * (1 - c) + c), torch.full_like(pstar, old_t))
+                target = torch.where(y > 0.5, target, neg_t.expand_as(y))
             loss = torch.nn.functional.binary_cross_entropy_with_logits(
                 logits, target, pos_weight=pos_weight_t, reduction='none')
             if args.focal:  # G8: focal modulation (1 - p_t)^gamma on top of pos_weight (hard, e.g. occluded, examples)

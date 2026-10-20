@@ -38,6 +38,7 @@ from clip_vit import CLIP_MEAN, CLIP_STD, PARModel  # noqa: E402
 BATCH_SIZE = 64
 TIME_BUDGET_S = float(os.environ.get("UPAR_TIME_BUDGET_S", 270))
 HARD_DEADLINE_S = float(os.environ.get("UPAR_HARD_DEADLINE_S", 295))
+SAFE_FINISH_S = float(os.environ.get("UPAR_SAFE_FINISH_S", 280))  # running pace check (see _watch_pace)
 DEFAULT_NUM_IMAGES = 29248
 _STATE: dict[str, Any] = {}
 
@@ -254,7 +255,40 @@ def _fit_budget(samples, batches, prep_per_image) -> None:
     _STATE["members"] = _STATE["members"][:keep]
     _STATE["tta"] = tta
     _STATE["member_tta"] = member_tta[:keep]
+    _STATE.update(costs=costs[:keep], total=total, done=0, rate_t0=time.monotonic(), rate_n0=0)
     _STATE["budget_checked"] = True
+
+
+def _watch_pace(n: int) -> None:
+    """Running check (the first-batch projection under-estimated zip 114 on the A10 and it hit the hard deadline):
+    after >= 5 batches at the current member set, project the finish from the measured pace; if it passes
+    SAFE_FINISH_S, drop flip-TTA first, then the member with the highest cost per unit of attribute weight."""
+    _STATE["done"] += n
+    since = _STATE["done"] - _STATE["rate_n0"]
+    if since < 5 * n or len(_STATE["members"]) <= 1 and not (_STATE["tta"] or any(_STATE["member_tta"])):
+        return
+    now = time.monotonic()
+    pace = (now - _STATE["rate_t0"]) / since
+    finish = now - _STATE["started"] + max(0, _STATE["total"] - _STATE["done"]) * pace
+    if finish <= SAFE_FINISH_S:
+        return
+    if _STATE["tta"] or any(_STATE["member_tta"]):
+        _STATE["tta"], _STATE["member_tta"] = False, [False] * len(_STATE["member_tta"])
+        what = "flip TTA"
+    else:
+        score = [c / float(m[3].sum()) for c, m in zip(_STATE["costs"], _STATE["members"])]
+        total_w = sum(m[3] for m in _STATE["members"])
+        # never drop a member that is the only one weighting some attribute (e.g. keep MetaCLIP/PE-L next to colour-only PE-B)
+        ok = [i for i in range(len(score)) if bool(((total_w - _STATE["members"][i][3]) > 0).all())]
+        if not ok:
+            _STATE["rate_t0"], _STATE["rate_n0"] = now, _STATE["done"]
+            return
+        i = max(ok, key=lambda j: score[j])
+        what = f"member {i} (size {_STATE['members'][i][1]})"
+        for key in ("members", "member_tta", "costs"):
+            _STATE[key] = _STATE[key][:i] + _STATE[key][i + 1:]
+    _log(f"pace {pace * 1000:.1f} ms/image -> projected finish {finish:.0f}s > {SAFE_FINISH_S:.0f}s: dropping {what}")
+    _STATE["rate_t0"], _STATE["rate_n0"] = now, _STATE["done"]
 
 
 def predict_batch(samples: list[dict[str, Any]]) -> list[list[float]]:
@@ -290,6 +324,7 @@ def predict_batch(samples: list[dict[str, Any]]) -> list[list[float]]:
     probs = np.clip(probs + _STATE["probability_bias"], 0.0, 1.0)
     del batches, canvases
     _STATE["batches_done"] += 1
+    _watch_pace(len(samples))
     if _STATE["batches_done"] % 20 == 0:
         _release_memory()
         _log(f"{_STATE['batches_done']} batches, {time.monotonic() - _STATE['started']:.0f}s, "
